@@ -1,0 +1,4 @@
+.env
+downloads/
+tools/
+node_modules/
