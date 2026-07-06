@@ -1,8 +1,8 @@
-import fs from "fs-extra";
-import path from "node:path";
 import axios from "axios";
 import { parse } from "csv-parse/sync";
-import { readFile } from "node:fs/promises";
+import fs from "fs-extra";
+import { readFile, stat } from "node:fs/promises";
+import path from "node:path";
 
 type VideoRow = {
     id: string;
@@ -10,67 +10,389 @@ type VideoRow = {
     url: string;
 };
 
+type TranscribeLocalOptions = {
+    retryUnknown?: boolean;
+};
+
+type SubmissionSuccess = {
+    status: "submitted";
+    transcriptionId: string;
+    submittedAt: string;
+    source: {
+        id: string;
+        title: string;
+        url: string;
+        audioPath: string;
+        audioSizeBytes: number;
+    };
+};
+
+type SubmissionFailure = {
+    status: "rejected" | "submission_unknown" | "missing_audio";
+    recordedAt: string;
+    source: {
+        id: string;
+        title: string;
+        url: string;
+        audioPath: string;
+    };
+    error: string;
+    httpStatus?: number;
+};
+
+type PendingSubmission = {
+    status: "pending_submission";
+    requestStartedAt: string;
+    source: {
+        id: string;
+        title: string;
+        url: string;
+        audioPath: string;
+        audioSizeBytes: number;
+    };
+};
+
+const MIN_REQUEST_SPACING_MS = 13_000;
+
 function sleep(milliseconds: number): Promise<void> {
     return new Promise((resolve) => {
         setTimeout(resolve, milliseconds);
     });
 }
 
-export async function transcribeLocal(csvPath: string) {
+function getErrorMessage(error: unknown): string {
+    if (axios.isAxiosError(error)) {
+        const responseData = error.response?.data;
+
+        if (typeof responseData === "string" && responseData.trim()) {
+            return responseData;
+        }
+
+        if (responseData !== undefined && responseData !== null) {
+            return JSON.stringify(responseData, null, 2);
+        }
+
+        return error.message;
+    }
+
+    if (error instanceof Error) {
+        return error.message;
+    }
+
+    return String(error);
+}
+
+function getHttpStatus(error: unknown): number | undefined {
+    if (axios.isAxiosError(error)) {
+        return error.response?.status;
+    }
+
+    return undefined;
+}
+
+function getFailureStatus(
+    error: unknown,
+): "rejected" | "submission_unknown" {
+    const httpStatus = getHttpStatus(error);
+
+    /*
+     * A 4xx response means Sofer definitely rejected the request.
+     * A timeout, connection failure, or 5xx could theoretically have
+     * reached Sofer before the response failed, so do not auto-retry it.
+     */
+    if (httpStatus !== undefined && httpStatus >= 400 && httpStatus < 500) {
+        return "rejected";
+    }
+
+    return "submission_unknown";
+}
+
+function getExistingTranscriptionId(
+    value: unknown,
+): string | undefined {
+    if (!value || typeof value !== "object") {
+        return undefined;
+    }
+
+    const record = value as Record<string, unknown>;
+
+    const possibleId =
+        record.transcriptionId ??
+        record.transcription_id ??
+        record.sofer_transcription_id;
+
+    return typeof possibleId === "string" ? possibleId : undefined;
+}
+
+async function hasSuccessfulSubmission(
+    submissionPath: string,
+    legacySubmissionPath: string,
+): Promise<boolean> {
+    const pathsToCheck = [submissionPath, legacySubmissionPath];
+
+    for (const filePath of pathsToCheck) {
+        if (!(await fs.pathExists(filePath))) {
+            continue;
+        }
+
+        try {
+            const savedData = await fs.readJson(filePath);
+
+            if (getExistingTranscriptionId(savedData)) {
+                return true;
+            }
+        } catch {
+            /*
+             * A damaged local JSON file should not be treated as success.
+             * The command will submit normally and overwrite the new-format path.
+             */
+        }
+    }
+
+    return false;
+}
+
+async function getSavedFailure(
+    failurePath: string,
+): Promise<SubmissionFailure | undefined> {
+    if (!(await fs.pathExists(failurePath))) {
+        return undefined;
+    }
+
+    try {
+        return await fs.readJson(failurePath) as SubmissionFailure;
+    } catch {
+        return undefined;
+    }
+}
+
+async function waitForRateLimit(
+    lastRequestStartedAt: number,
+): Promise<void> {
+    if (lastRequestStartedAt === 0) {
+        return;
+    }
+
+    const elapsedMilliseconds = Date.now() - lastRequestStartedAt;
+
+    const waitMilliseconds = Math.max(
+        0,
+        MIN_REQUEST_SPACING_MS - elapsedMilliseconds,
+    );
+
+    if (waitMilliseconds > 0) {
+        console.log(
+            `Waiting ${Math.ceil(waitMilliseconds / 1000)} seconds before the next Sofer request...`,
+        );
+
+        await sleep(waitMilliseconds);
+    }
+}
+
+function validateRows(records: VideoRow[]): void {
+    if (records.length === 0) {
+        throw new Error("The CSV contains no rows.");
+    }
+
+    const ids = new Set<string>();
+
+    for (const video of records) {
+        if (!video.id || !video.title || !video.url) {
+            throw new Error(
+                "Every CSV row must include id, title, and url.",
+            );
+        }
+
+        if (ids.has(video.id)) {
+            throw new Error(
+                `Duplicate id found in CSV: ${video.id}`,
+            );
+        }
+
+        ids.add(video.id);
+    }
+}
+
+export async function transcribeLocal(
+    csvPath: string,
+    options: TranscribeLocalOptions = {},
+): Promise<void> {
     const apiKey = process.env.SOFER_API_KEY;
 
     if (!apiKey) {
         throw new Error(
-            "SOFER_API_KEY is missing. Add it to your .env file in the project root.",
+            "SOFER_API_KEY is missing. Add it to your .env file.",
         );
     }
 
-    const csv = await fs.readFile(csvPath, "utf-8");
+    const csvContents = await fs.readFile(csvPath, "utf-8");
 
-    const records = parse(csv, {
+    const records = parse(csvContents, {
         columns: true,
         skip_empty_lines: true,
         trim: true,
     }) as VideoRow[];
 
-    await fs.ensureDir("data/sofer");
+    validateRows(records);
 
-    const SOFER_REQUEST_INTERVAL_MS = 13_000;
+    const submissionDirectory = path.resolve(
+        "data",
+        "sofer",
+        "submissions",
+    );
+
+    await fs.ensureDir(submissionDirectory);
+
+    let submittedCount = 0;
+    let skippedSubmittedCount = 0;
+    let skippedUnknownCount = 0;
+    let missingAudioCount = 0;
+    let rejectedCount = 0;
+    let unknownFailureCount = 0;
+
+    let lastRequestStartedAt = 0;
+
+    console.log(
+        `Submitting ${records.length} CSV item(s) to Sofer one at a time...`,
+    );
 
     for (let index = 0; index < records.length; index += 1) {
         const video = records[index];
+
         const audioPath = path.resolve(
             "downloads",
             "audio",
             `${video.id}.mp3`,
         );
 
-        if (!await fs.pathExists(audioPath)) {
-            console.log(
-                `Skipping ${video.id}: MP3 not found at ${audioPath}`,
-            );
+        const submissionPath = path.join(
+            submissionDirectory,
+            `${video.id}.json`,
+        );
+
+        const pendingPath = path.join(
+            submissionDirectory,
+            `${video.id}.pending.json`,
+        );
+
+        /*
+         * Supports the older location used by your first working test,
+         * so 006 is not accidentally submitted again.
+         */
+        const legacySubmissionPath = path.resolve(
+            "data",
+            "sofer",
+            `${video.id}.json`,
+        );
+
+        const failurePath = path.join(
+            submissionDirectory,
+            `${video.id}.error.json`,
+        );
+
+        const progressLabel = `[${index + 1}/${records.length}] ${video.id}: ${video.title}`;
+
+        if (
+            await hasSuccessfulSubmission(
+                submissionPath,
+                legacySubmissionPath,
+            )
+        ) {
+            skippedSubmittedCount += 1;
+            console.log(`${progressLabel} — already submitted; skipping.`);
             continue;
         }
 
-        const audioStats = await fs.stat(audioPath);
+        const hasPendingSubmission = await fs.pathExists(pendingPath);
+
+        if (hasPendingSubmission && !options.retryUnknown) {
+            skippedUnknownCount += 1;
+
+            console.log(
+                `${progressLabel} — a prior request may have been interrupted; skipping to avoid a duplicate charge.`,
+            );
+
+            continue;
+        }
+
+        const savedFailure = await getSavedFailure(failurePath);
+
+        if (
+            savedFailure?.status === "submission_unknown" &&
+            !options.retryUnknown
+        ) {
+            skippedUnknownCount += 1;
+
+            console.log(
+                `${progressLabel} — previous submission outcome is unknown; skipping to avoid a duplicate charge.`,
+            );
+
+            continue;
+        }
+
+        if (!(await fs.pathExists(audioPath))) {
+            const failure: SubmissionFailure = {
+                status: "missing_audio",
+                recordedAt: new Date().toISOString(),
+                source: {
+                    id: video.id,
+                    title: video.title,
+                    url: video.url,
+                    audioPath,
+                },
+                error: "Expected MP3 file was not found.",
+            };
+
+            await fs.writeJson(failurePath, failure, {
+                spaces: 2,
+            });
+
+            missingAudioCount += 1;
+
+            console.log(
+                `${progressLabel} — MP3 not found; skipping.`,
+            );
+
+            continue;
+        }
+
+        const audioStats = await stat(audioPath);
+        const audioSizeMegabytes = (
+            audioStats.size /
+            1024 /
+            1024
+        ).toFixed(1);
 
         console.log(
-            `Uploading ${video.id}: ${video.title} ` +
-            `(${(audioStats.size / 1024 / 1024).toFixed(1)} MB MP3)`,
+            `${progressLabel} — uploading ${audioSizeMegabytes} MB MP3...`,
         );
 
         const base64Audio = await readFile(audioPath, {
             encoding: "base64",
         });
 
-        console.log(
-            `Base64 request payload: ${(base64Audio.length / 1024 / 1024).toFixed(1)} MB`,
-        );
-
-        let response;
-
         try {
-            response = await axios.post<unknown>(
+            await waitForRateLimit(lastRequestStartedAt);
+
+            const pendingSubmission: PendingSubmission = {
+                status: "pending_submission",
+                requestStartedAt: new Date().toISOString(),
+                source: {
+                    id: video.id,
+                    title: video.title,
+                    url: video.url,
+                    audioPath,
+                    audioSizeBytes: audioStats.size,
+                },
+            };
+
+            await fs.writeJson(pendingPath, pendingSubmission, {
+                spaces: 2,
+            });
+
+            lastRequestStartedAt = Date.now();
+
+            const response = await axios.post<unknown>(
                 "https://api.sofer.ai/v1/transcriptions/",
                 {
                     audio_file: base64Audio,
@@ -90,53 +412,118 @@ export async function transcribeLocal(csvPath: string) {
                     timeout: 300_000,
                 },
             );
-        } catch (error) {
-            if (axios.isAxiosError(error)) {
-                const status = error.response?.status;
-                const responseData = error.response?.data;
 
-                throw new Error(
-                    `Sofer request failed for ${video.id}` +
-                    `${status ? ` (${status})` : ""}: ` +
-                    `${responseData ? JSON.stringify(responseData) : error.message}`,
+            if (typeof response.data !== "string") {
+                const failure: SubmissionFailure = {
+                    status: "submission_unknown",
+                    recordedAt: new Date().toISOString(),
+                    source: {
+                        id: video.id,
+                        title: video.title,
+                        url: video.url,
+                        audioPath,
+                    },
+                    error:
+                        `Sofer returned an unexpected successful response: ` +
+                        JSON.stringify(response.data),
+                };
+
+                await fs.writeJson(failurePath, failure, {
+                    spaces: 2,
+                });
+
+                unknownFailureCount += 1;
+
+                console.error(
+                    `${video.id} returned an unexpected response from Sofer. Keeping its pending marker to avoid a duplicate submission.`,
+                );
+            } else {
+                const transcriptionId = response.data;
+
+                const success: SubmissionSuccess = {
+                    status: "submitted",
+                    transcriptionId,
+                    submittedAt: new Date().toISOString(),
+                    source: {
+                        id: video.id,
+                        title: video.title,
+                        url: video.url,
+                        audioPath,
+                        audioSizeBytes: audioStats.size,
+                    },
+                };
+
+                await fs.writeJson(submissionPath, success, {
+                    spaces: 2,
+                });
+
+                await fs.remove(failurePath);
+                await fs.remove(pendingPath);
+
+                submittedCount += 1;
+
+                console.log(
+                    `${video.id} submitted — transcription ID: ${transcriptionId}`,
                 );
             }
+        } catch (error) {
+            const httpStatus = getHttpStatus(error);
+            const failureStatus = getFailureStatus(error);
 
-            throw error;
+            const failure: SubmissionFailure = {
+                status: failureStatus,
+                recordedAt: new Date().toISOString(),
+                source: {
+                    id: video.id,
+                    title: video.title,
+                    url: video.url,
+                    audioPath,
+                },
+                error: getErrorMessage(error),
+                httpStatus,
+            };
+
+            await fs.writeJson(failurePath, failure, {
+                spaces: 2,
+            });
+
+            if (failureStatus === "rejected") {
+                await fs.remove(pendingPath);
+                rejectedCount += 1;
+
+                console.error(
+                    `${video.id} was rejected by Sofer${httpStatus ? ` (HTTP ${httpStatus})` : ""}.`,
+                );
+            } else {
+                unknownFailureCount += 1;
+
+                console.error(
+                    `${video.id} has an unknown submission outcome${httpStatus ? ` (HTTP ${httpStatus})` : ""}. It will not be retried automatically.`,
+                );
+            }
         }
+    }
 
-        if (typeof response.data !== "string") {
-            throw new Error(
-                `Sofer returned an unexpected successful response for ${video.id}: ` +
-                JSON.stringify(response.data),
-            );
-        }
+    console.log("");
+    console.log("Submission run complete.");
+    console.log(`Newly submitted: ${submittedCount}`);
+    console.log(`Already submitted and skipped: ${skippedSubmittedCount}`);
+    console.log(`Missing MP3 files: ${missingAudioCount}`);
+    console.log(`Rejected by Sofer: ${rejectedCount}`);
+    console.log(
+        `Unknown submission outcomes skipped/recorded: ${skippedUnknownCount + unknownFailureCount}`,
+    );
 
-        const transcriptionId = response.data;
-
-        await fs.writeJson(
-            `data/sofer/${video.id}.json`,
-            {
-                videoId: video.id,
-                videoTitle: video.title,
-                sourceUrl: video.url,
-                audioPath,
-                transcriptionId,
-                status: "SUBMITTED",
-                submittedAt: new Date().toISOString(),
-            },
-            { spaces: 2 },
-        );
-
+    if (unknownFailureCount > 0 || skippedUnknownCount > 0) {
+        console.log("");
         console.log(
-            `Submitted ${video.id} — transcription ID: ${transcriptionId}`,
+            "Unknown outcomes were saved as .error.json files in data/sofer/submissions.",
         );
-
-        const isLastVideo = index === records.length - 1;
-
-        if (!isLastVideo) {
-            console.log("Waiting 13 seconds to respect Sofer's rate limit...");
-            await sleep(SOFER_REQUEST_INTERVAL_MS);
-        }
+        console.log(
+            "Do not rerun those blindly: the request may have reached Sofer before the network error.",
+        );
+        console.log(
+            "After checking with Sofer, retry them explicitly with --retry-unknown.",
+        );
     }
 }
