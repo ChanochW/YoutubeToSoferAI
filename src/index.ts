@@ -2,6 +2,7 @@ import { Command } from "commander";
 import { importVideos } from "./commands/importVideos";
 import { downloadVideos } from "./commands/downloadVideos";
 import { transcribeLocal } from "./commands/transcribeLocal";
+import { submitStandardBatch } from "./commands/submitStandardBatch";
 import "dotenv/config";
 
 const program = new Command();
@@ -33,6 +34,19 @@ program
     .description("Upload locally downloaded MP3 files to Sofer for transcription")
     .action(async (csvPath) => {
         await transcribeLocal(csvPath);
+    });
+
+program
+    .command("submit-standard-batch")
+    .argument(
+        "<csvPath>",
+        "CSV containing id, title, and source url columns",
+    )
+    .description(
+        "Extract direct audio links through Sofer and create a standard batch",
+    )
+    .action(async (csvPath) => {
+        await submitStandardBatch(csvPath);
     });
 
 async function main() {
