@@ -3,6 +3,7 @@ import { importVideos } from "./commands/importVideos";
 import { downloadVideos } from "./commands/downloadVideos";
 import { transcribeLocal } from "./commands/transcribeLocal";
 import { submitStandardBatch } from "./commands/submitStandardBatch";
+import {checkTranscriptions} from "./commands/checkTranscriptions";
 import "dotenv/config";
 
 const program = new Command();
@@ -42,6 +43,15 @@ program
         await transcribeLocal(csvPath, {
             retryUnknown: options.retryUnknown,
         });
+    });
+
+program
+    .command("check-transcriptions")
+    .description(
+        "Check the status of every locally saved Sofer transcription",
+    )
+    .action(async () => {
+        await checkTranscriptions();
     });
 
 program

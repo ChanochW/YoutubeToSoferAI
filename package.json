@@ -8,6 +8,7 @@
     "import": "tsx src/index.ts import data/videos.csv",
     "download": "tsx src/index.ts download data/videos.csv",
     "transcribe-local": "tsx src/index.ts transcribe-local data/videos.csv",
+    "check-transcriptions": "tsx src/index.ts check-transcriptions",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
