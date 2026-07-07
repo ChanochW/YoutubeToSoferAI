@@ -3,6 +3,8 @@ import { parse } from "csv-parse/sync";
 import fs from "fs-extra";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { stdin as input, stdout as output } from "node:process";
+import { createInterface } from "node:readline/promises";
 
 type VideoRow = {
     id: string;
@@ -53,6 +55,112 @@ type PendingSubmission = {
 };
 
 const MIN_REQUEST_SPACING_MS = 13_000;
+const ESTIMATED_API_REQUEST_OVERHEAD_MS = 4_000;
+
+type DurationResponse = {
+    duration_seconds: number;
+};
+
+type PreparedSubmission = {
+    video: VideoRow;
+    audioPath: string;
+    audioSizeBytes: number;
+    durationSeconds: number;
+};
+
+const PRICE_PER_AUDIO_HOUR_USD = 1.20;
+
+function formatDuration(totalSeconds: number): string {
+    const roundedSeconds = Math.round(totalSeconds);
+
+    const hours = Math.floor(roundedSeconds / 3600);
+    const minutes = Math.floor((roundedSeconds % 3600) / 60);
+    const seconds = roundedSeconds % 60;
+
+    const parts: string[] = [];
+
+    if (hours > 0) {
+        parts.push(`${hours} hour${hours === 1 ? "" : "s"}`);
+    }
+
+    if (minutes > 0) {
+        parts.push(`${minutes} minute${minutes === 1 ? "" : "s"}`);
+    }
+
+    if (seconds > 0 || parts.length === 0) {
+        parts.push(`${seconds} second${seconds === 1 ? "" : "s"}`);
+    }
+
+    return parts.join(", ");
+}
+
+function formatUsd(amount: number): string {
+    return new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+    }).format(amount);
+}
+
+async function askYesNo(question: string): Promise<boolean> {
+    const readline = createInterface({
+        input,
+        output,
+    });
+
+    try {
+        while (true) {
+            const answer = await readline.question(`${question} (y/n): `);
+            const normalizedAnswer = answer.trim().toLowerCase();
+
+            if (
+                normalizedAnswer === "y" ||
+                normalizedAnswer === "yes"
+            ) {
+                return true;
+            }
+
+            if (
+                normalizedAnswer === "n" ||
+                normalizedAnswer === "no"
+            ) {
+                return false;
+            }
+
+            console.log("Please enter y or n.");
+        }
+    } finally {
+        readline.close();
+    }
+}
+
+async function getAudioDuration(
+    base64Audio: string,
+    apiKey: string,
+): Promise<number> {
+    const response = await axios.post<unknown>(
+        "https://api.sofer.ai/v1/utils/duration",
+        {
+            audio_file: base64Audio,
+        },
+        {
+            headers: {
+                Authorization: `Bearer ${apiKey}`,
+                "Content-Type": "application/json",
+            },
+            timeout: 300_000,
+        },
+    );
+
+    const data = response.data as Partial<DurationResponse>;
+
+    if (typeof data.duration_seconds !== "number") {
+        throw new Error(
+            `Sofer returned an unexpected duration response: ${JSON.stringify(response.data)}`,
+        );
+    }
+
+    return data.duration_seconds;
+}
 
 function sleep(milliseconds: number): Promise<void> {
     return new Promise((resolve) => {
@@ -241,20 +349,61 @@ export async function transcribeLocal(
         "submissions",
     );
 
-    await fs.ensureDir(submissionDirectory);
+    let lastSoferRequestStartedAt = 0;
 
-    let submittedCount = 0;
-    let skippedSubmittedCount = 0;
+    let alreadySubmittedCount = 0;
     let skippedUnknownCount = 0;
     let missingAudioCount = 0;
-    let rejectedCount = 0;
-    let unknownFailureCount = 0;
 
-    let lastRequestStartedAt = 0;
+    const preparedSubmissions: PreparedSubmission[] = [];
+
+    const durationCheckEstimatedSeconds =
+        (
+            Math.max(0, records.length - 1) *
+            MIN_REQUEST_SPACING_MS
+            +
+            records.length *
+            ESTIMATED_API_REQUEST_OVERHEAD_MS
+        ) / 1000;
+
+    const submissionEstimatedSeconds =
+        (
+            Math.max(0, records.length - 1) *
+            MIN_REQUEST_SPACING_MS
+            +
+            records.length *
+            ESTIMATED_API_REQUEST_OVERHEAD_MS
+        ) / 1000;
+
+    const totalEstimatedSeconds =
+        durationCheckEstimatedSeconds +
+        submissionEstimatedSeconds;
 
     console.log(
-        `Submitting ${records.length} CSV item(s) to Sofer one at a time...`,
+        `Calculating the projected cost for ${records.length} CSV item(s)...`,
     );
+
+    console.log(
+        `Estimated time to calculate the cost: Approximately ${formatDuration(durationCheckEstimatedSeconds)}.`,
+    );
+
+    console.log(
+        `Estimated time to submit all the audio clips to Sofer.ai: Approximately ${formatDuration(submissionEstimatedSeconds)}.`,
+    );
+
+    console.log(`Estimated total processing time: Approximately ${formatDuration(totalEstimatedSeconds)}.`);
+
+    const shouldCalculateDurations = await askYesNo(
+        "Continue with duration checks?",
+    );
+
+    if (!shouldCalculateDurations) {
+        console.log(
+            "Cancelled. No duration checks or transcription submissions were made.",
+        );
+
+        return;
+    }
 
     for (let index = 0; index < records.length; index += 1) {
         const video = records[index];
@@ -270,19 +419,15 @@ export async function transcribeLocal(
             `${video.id}.json`,
         );
 
-        const pendingPath = path.join(
-            submissionDirectory,
-            `${video.id}.pending.json`,
-        );
-
-        /*
-         * Supports the older location used by your first working test,
-         * so 006 is not accidentally submitted again.
-         */
         const legacySubmissionPath = path.resolve(
             "data",
             "sofer",
             `${video.id}.json`,
+        );
+
+        const pendingPath = path.join(
+            submissionDirectory,
+            `${video.id}.pending.json`,
         );
 
         const failurePath = path.join(
@@ -290,7 +435,8 @@ export async function transcribeLocal(
             `${video.id}.error.json`,
         );
 
-        const progressLabel = `[${index + 1}/${records.length}] ${video.id}: ${video.title}`;
+        const progressLabel =
+            `[${index + 1}/${records.length}] ${video.id}: ${video.title}`;
 
         if (
             await hasSuccessfulSubmission(
@@ -298,18 +444,23 @@ export async function transcribeLocal(
                 legacySubmissionPath,
             )
         ) {
-            skippedSubmittedCount += 1;
-            console.log(`${progressLabel} — already submitted; skipping.`);
+            alreadySubmittedCount += 1;
+
+            console.log(
+                `${progressLabel} — already submitted; excluded from estimate.`,
+            );
+
             continue;
         }
 
-        const hasPendingSubmission = await fs.pathExists(pendingPath);
-
-        if (hasPendingSubmission && !options.retryUnknown) {
+        if (
+            await fs.pathExists(pendingPath) &&
+            !options.retryUnknown
+        ) {
             skippedUnknownCount += 1;
 
             console.log(
-                `${progressLabel} — a prior request may have been interrupted; skipping to avoid a duplicate charge.`,
+                `${progressLabel} — prior submission may be uncertain; excluded from estimate.`,
             );
 
             continue;
@@ -324,55 +475,184 @@ export async function transcribeLocal(
             skippedUnknownCount += 1;
 
             console.log(
-                `${progressLabel} — previous submission outcome is unknown; skipping to avoid a duplicate charge.`,
+                `${progressLabel} — prior submission outcome is unknown; excluded from estimate.`,
             );
 
             continue;
         }
 
         if (!(await fs.pathExists(audioPath))) {
-            const failure: SubmissionFailure = {
-                status: "missing_audio",
-                recordedAt: new Date().toISOString(),
-                source: {
-                    id: video.id,
-                    title: video.title,
-                    url: video.url,
-                    audioPath,
-                },
-                error: "Expected MP3 file was not found.",
-            };
-
-            await fs.writeJson(failurePath, failure, {
-                spaces: 2,
-            });
-
             missingAudioCount += 1;
 
             console.log(
-                `${progressLabel} — MP3 not found; skipping.`,
+                `${progressLabel} — MP3 not found; excluded from estimate.`,
             );
 
             continue;
         }
 
         const audioStats = await stat(audioPath);
-        const audioSizeMegabytes = (
-            audioStats.size /
-            1024 /
-            1024
-        ).toFixed(1);
 
         console.log(
-            `${progressLabel} — uploading ${audioSizeMegabytes} MB MP3...`,
+            `${progressLabel} — calculating duration...`,
         );
 
         const base64Audio = await readFile(audioPath, {
             encoding: "base64",
         });
 
+        await waitForRateLimit(lastSoferRequestStartedAt);
+
+        lastSoferRequestStartedAt = Date.now();
+
+        let durationSeconds: number;
+
         try {
-            await waitForRateLimit(lastRequestStartedAt);
+            durationSeconds = await getAudioDuration(
+                base64Audio,
+                apiKey,
+            );
+        } catch (error) {
+            throw new Error(
+                `Could not calculate duration for ${video.id}: ${video.title}\n` +
+                `${getErrorMessage(error)}\n\n` +
+                "No files were submitted.",
+            );
+        }
+
+        if (durationSeconds <= 0) {
+            throw new Error(
+                `Sofer could not determine the duration for ${video.id}: ${video.title}.\n` +
+                "No files were submitted because the projected total would be incomplete.",
+            );
+        }
+
+        preparedSubmissions.push({
+            video,
+            audioPath,
+            audioSizeBytes: audioStats.size,
+            durationSeconds,
+        });
+
+        console.log(
+            `${progressLabel} — ${formatDuration(durationSeconds)}.`,
+        );
+    }
+
+    if (preparedSubmissions.length === 0) {
+        console.log("");
+        console.log("There are no eligible MP3 files to submit.");
+        console.log(`Already submitted: ${alreadySubmittedCount}`);
+        console.log(`Unknown prior outcomes skipped: ${skippedUnknownCount}`);
+        console.log(`Missing MP3 files skipped: ${missingAudioCount}`);
+
+        return;
+    }
+
+    const totalDurationSeconds = preparedSubmissions.reduce(
+        (total, submission) => total + submission.durationSeconds,
+        0,
+    );
+
+    /*
+     * Sofer bills v1 single transcriptions proportionally by exact
+     * audio duration in seconds, with no per-file minimum or rounding
+     * to the next minute/hour.
+     */
+    const projectedCost =
+        (totalDurationSeconds / 3600) *
+        PRICE_PER_AUDIO_HOUR_USD;
+
+    console.log("");
+    console.log("Submission preflight complete.");
+    console.log(`Clips to submit: ${preparedSubmissions.length}`);
+    console.log(`Total audio duration: ${formatDuration(totalDurationSeconds)}`);
+    console.log(
+        `Projected transcription cost: ${formatUsd(projectedCost)} ` +
+        `(prorated by exact audio duration at ${formatUsd(PRICE_PER_AUDIO_HOUR_USD)} per audio hour ` +
+        `[Using AI Model: v1, Mode: One Speaker]).`,
+    );
+
+    if (alreadySubmittedCount > 0) {
+        console.log(`Already submitted and excluded: ${alreadySubmittedCount}`);
+    }
+
+    if (skippedUnknownCount > 0) {
+        console.log(
+            `Unknown prior outcomes excluded: ${skippedUnknownCount}`,
+        );
+    }
+
+    if (missingAudioCount > 0) {
+        console.log(`Missing MP3 files excluded: ${missingAudioCount}`);
+    }
+
+    const shouldProceed = await askYesNo(
+        "Proceed with submitting these clips to Sofer?",
+    );
+
+    if (!shouldProceed) {
+        console.log(
+            "Cancelled. No transcription submissions or submission-state files were created.",
+        );
+
+        return;
+    }
+
+    await fs.ensureDir(submissionDirectory);
+
+    let submittedCount = 0;
+    let rejectedCount = 0;
+    let unknownFailureCount = 0;
+
+    console.log("");
+    console.log(
+        `Submitting ${preparedSubmissions.length} approved clip(s) to Sofer...`,
+    );
+
+    for (
+        let index = 0;
+        index < preparedSubmissions.length;
+        index += 1
+    ) {
+        const preparedSubmission = preparedSubmissions[index];
+
+        const {
+            video,
+            audioPath,
+            audioSizeBytes,
+        } = preparedSubmission;
+
+        const submissionPath = path.join(
+            submissionDirectory,
+            `${video.id}.json`,
+        );
+
+        const pendingPath = path.join(
+            submissionDirectory,
+            `${video.id}.pending.json`,
+        );
+
+        const failurePath = path.join(
+            submissionDirectory,
+            `${video.id}.error.json`,
+        );
+
+        const progressLabel =
+            `[${index + 1}/${preparedSubmissions.length}] ${video.id}: ${video.title}`;
+
+        console.log(`${progressLabel} — uploading...`);
+
+        /*
+         * Do not keep every Base64 MP3 in memory from the preflight phase.
+         * Read one file again only when it is actually ready to upload.
+         */
+        const base64Audio = await readFile(audioPath, {
+            encoding: "base64",
+        });
+
+        try {
+            await waitForRateLimit(lastSoferRequestStartedAt);
 
             const pendingSubmission: PendingSubmission = {
                 status: "pending_submission",
@@ -382,7 +662,7 @@ export async function transcribeLocal(
                     title: video.title,
                     url: video.url,
                     audioPath,
-                    audioSizeBytes: audioStats.size,
+                    audioSizeBytes,
                 },
             };
 
@@ -390,7 +670,7 @@ export async function transcribeLocal(
                 spaces: 2,
             });
 
-            lastRequestStartedAt = Date.now();
+            lastSoferRequestStartedAt = Date.now();
 
             const response = await axios.post<unknown>(
                 "https://api.sofer.ai/v1/transcriptions/",
@@ -424,7 +704,7 @@ export async function transcribeLocal(
                         audioPath,
                     },
                     error:
-                        `Sofer returned an unexpected successful response: ` +
+                        "Sofer returned an unexpected successful response: " +
                         JSON.stringify(response.data),
                 };
 
@@ -435,37 +715,39 @@ export async function transcribeLocal(
                 unknownFailureCount += 1;
 
                 console.error(
-                    `${video.id} returned an unexpected response from Sofer. Keeping its pending marker to avoid a duplicate submission.`,
+                    `${video.id} returned an unexpected response. Its pending marker was retained.`,
                 );
-            } else {
-                const transcriptionId = response.data;
 
-                const success: SubmissionSuccess = {
-                    status: "submitted",
-                    transcriptionId,
-                    submittedAt: new Date().toISOString(),
-                    source: {
-                        id: video.id,
-                        title: video.title,
-                        url: video.url,
-                        audioPath,
-                        audioSizeBytes: audioStats.size,
-                    },
-                };
-
-                await fs.writeJson(submissionPath, success, {
-                    spaces: 2,
-                });
-
-                await fs.remove(failurePath);
-                await fs.remove(pendingPath);
-
-                submittedCount += 1;
-
-                console.log(
-                    `${video.id} submitted — transcription ID: ${transcriptionId}`,
-                );
+                continue;
             }
+
+            const transcriptionId = response.data;
+
+            const success: SubmissionSuccess = {
+                status: "submitted",
+                transcriptionId,
+                submittedAt: new Date().toISOString(),
+                source: {
+                    id: video.id,
+                    title: video.title,
+                    url: video.url,
+                    audioPath,
+                    audioSizeBytes,
+                },
+            };
+
+            await fs.writeJson(submissionPath, success, {
+                spaces: 2,
+            });
+
+            await fs.remove(failurePath);
+            await fs.remove(pendingPath);
+
+            submittedCount += 1;
+
+            console.log(
+                `${video.id} submitted — transcription ID: ${transcriptionId}`,
+            );
         } catch (error) {
             const httpStatus = getHttpStatus(error);
             const failureStatus = getFailureStatus(error);
@@ -489,6 +771,7 @@ export async function transcribeLocal(
 
             if (failureStatus === "rejected") {
                 await fs.remove(pendingPath);
+
                 rejectedCount += 1;
 
                 console.error(
@@ -506,18 +789,14 @@ export async function transcribeLocal(
 
     console.log("");
     console.log("Submission run complete.");
-    console.log(`Newly submitted: ${submittedCount}`);
-    console.log(`Already submitted and skipped: ${skippedSubmittedCount}`);
-    console.log(`Missing MP3 files: ${missingAudioCount}`);
+    console.log(`Submitted: ${submittedCount}`);
     console.log(`Rejected by Sofer: ${rejectedCount}`);
-    console.log(
-        `Unknown submission outcomes skipped/recorded: ${skippedUnknownCount + unknownFailureCount}`,
-    );
+    console.log(`Unknown outcomes recorded: ${unknownFailureCount}`);
 
     if (unknownFailureCount > 0 || skippedUnknownCount > 0) {
         console.log("");
         console.log(
-            "Unknown outcomes were saved as .error.json files in data/sofer/submissions.",
+            "Unknown outcomes may be represented by .pending.json and/or .error.json files in data/sofer/submissions.",
         );
         console.log(
             "Do not rerun those blindly: the request may have reached Sofer before the network error.",
@@ -527,3 +806,7 @@ export async function transcribeLocal(
         );
     }
 }
+
+//todo proper cost calculation: ask sofer team
+//todo proper time estimation
+//todo make a rolling time estimation for both the cost check and the actual uploading and have it count down at the bottom of the console
