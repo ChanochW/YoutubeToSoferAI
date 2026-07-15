@@ -14,6 +14,7 @@ type VideoRow = {
 
 type TranscribeLocalOptions = {
     retryUnknown?: boolean;
+    skipCostCheck?: boolean;
 };
 
 type SubmissionSuccess = {
@@ -65,7 +66,7 @@ type PreparedSubmission = {
     video: VideoRow;
     audioPath: string;
     audioSizeBytes: number;
-    durationSeconds: number;
+    durationSeconds?: number;
 };
 
 const PRICE_PER_AUDIO_HOUR_USD = 1.20;
@@ -379,30 +380,42 @@ export async function transcribeLocal(
         durationCheckEstimatedSeconds +
         submissionEstimatedSeconds;
 
-    console.log(
-        `Calculating the projected cost for ${records.length} CSV item(s)...`,
-    );
-
-    console.log(
-        `Estimated time to calculate the cost: Approximately ${formatDuration(durationCheckEstimatedSeconds)}.`,
-    );
-
-    console.log(
-        `Estimated time to submit all the audio clips to Sofer.ai: Approximately ${formatDuration(submissionEstimatedSeconds)}.`,
-    );
-
-    console.log(`Estimated total processing time: Approximately ${formatDuration(totalEstimatedSeconds)}.`);
-
-    const shouldCalculateDurations = await askYesNo(
-        "Continue with duration checks?",
-    );
-
-    if (!shouldCalculateDurations) {
+    if (options.skipCostCheck) {
         console.log(
-            "Cancelled. No duration checks or transcription submissions were made.",
+            `Unchecked mode enabled. Skipping duration checks and cost estimate for ${records.length} CSV item(s).`,
         );
 
-        return;
+        console.log(
+            `Estimated time to submit all the audio clips to Sofer.ai: Approximately ${formatDuration(submissionEstimatedSeconds)}.`,
+        );
+    } else {
+        console.log(
+            `Calculating the projected cost for ${records.length} CSV item(s)...`,
+        );
+
+        console.log(
+            `Estimated time to calculate the cost: Approximately ${formatDuration(durationCheckEstimatedSeconds)}.`,
+        );
+
+        console.log(
+            `Estimated time to submit all the audio clips to Sofer.ai: Approximately ${formatDuration(submissionEstimatedSeconds)}.`,
+        );
+
+        console.log(
+            `Estimated total processing time: Approximately ${formatDuration(totalEstimatedSeconds)}.`,
+        );
+
+        const shouldCalculateDurations = await askYesNo(
+            "Continue with duration checks?",
+        );
+
+        if (!shouldCalculateDurations) {
+            console.log(
+                "Cancelled. No duration checks or transcription submissions were made.",
+            );
+
+            return;
+        }
     }
 
     for (let index = 0; index < records.length; index += 1) {
@@ -493,6 +506,20 @@ export async function transcribeLocal(
 
         const audioStats = await stat(audioPath);
 
+        if (options.skipCostCheck) {
+            preparedSubmissions.push({
+                video,
+                audioPath,
+                audioSizeBytes: audioStats.size,
+            });
+
+            console.log(
+                `${progressLabel} — ready to upload; duration unchecked.`,
+            );
+
+            continue;
+        }
+
         console.log(
             `${progressLabel} — calculating duration...`,
         );
@@ -549,29 +576,38 @@ export async function transcribeLocal(
         return;
     }
 
-    const totalDurationSeconds = preparedSubmissions.reduce(
-        (total, submission) => total + submission.durationSeconds,
-        0,
-    );
+    if (!options.skipCostCheck) {
+        const totalDurationSeconds = preparedSubmissions.reduce(
+            (total, submission) => total + submission.durationSeconds,
+            0,
+        );
 
-    /*
-     * Sofer bills v1 single transcriptions proportionally by exact
-     * audio duration in seconds, with no per-file minimum or rounding
-     * to the next minute/hour.
-     */
-    const projectedCost =
-        (totalDurationSeconds / 3600) *
-        PRICE_PER_AUDIO_HOUR_USD;
+        /*
+         * Sofer bills v1 single transcriptions proportionally by exact
+         * audio duration in seconds, with no per-file minimum or rounding
+         * to the next minute/hour.
+         */
+        const projectedCost =
+            (totalDurationSeconds / 3600) *
+            PRICE_PER_AUDIO_HOUR_USD;
 
-    console.log("");
-    console.log("Submission preflight complete.");
-    console.log(`Clips to submit: ${preparedSubmissions.length}`);
-    console.log(`Total audio duration: ${formatDuration(totalDurationSeconds)}`);
-    console.log(
-        `Projected transcription cost: ${formatUsd(projectedCost)} ` +
-        `(prorated by exact audio duration at ${formatUsd(PRICE_PER_AUDIO_HOUR_USD)} per audio hour ` +
-        `[Using AI Model: v1, Mode: One Speaker]).`,
-    );
+        console.log("");
+        console.log("Submission preflight complete.");
+        console.log(`Clips to submit: ${preparedSubmissions.length}`);
+        console.log(`Total audio duration: ${formatDuration(totalDurationSeconds)}`);
+        console.log(
+            `Projected transcription cost: ${formatUsd(projectedCost)} ` +
+            `(prorated by exact audio duration at ${formatUsd(PRICE_PER_AUDIO_HOUR_USD)} per audio hour ` +
+            `[Using AI Model: v1, Mode: One Speaker]).`,
+        );
+    } else {
+        console.log("");
+        console.log("Unchecked submission preflight complete.");
+        console.log(`Clips to submit: ${preparedSubmissions.length}`);
+        console.log(
+            "Audio duration and projected cost were not calculated.",
+        );
+    }
 
     if (alreadySubmittedCount > 0) {
         console.log(`Already submitted and excluded: ${alreadySubmittedCount}`);
@@ -588,12 +624,16 @@ export async function transcribeLocal(
     }
 
     const shouldProceed = await askYesNo(
-        "Proceed with submitting these clips to Sofer?",
+        options.skipCostCheck
+            ? "Proceed without checking duration/cost?"
+            : "Proceed with submitting these clips to Sofer?",
     );
 
     if (!shouldProceed) {
         console.log(
-            "Cancelled. No transcription submissions or submission-state files were created.",
+            options.skipCostCheck
+                ? "Cancelled. No transcription submissions were made."
+                : "Cancelled. No transcription submissions or submission-state files were created.",
         );
 
         return;
@@ -807,6 +847,5 @@ export async function transcribeLocal(
     }
 }
 
-//todo proper cost calculation: ask sofer team
 //todo proper time estimation
 //todo make a rolling time estimation for both the cost check and the actual uploading and have it count down at the bottom of the console

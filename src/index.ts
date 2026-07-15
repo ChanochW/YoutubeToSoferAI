@@ -36,12 +36,17 @@ program
         "--retry-unknown",
         "Retry clips whose earlier upload outcome was unknown",
     )
+    .option(
+        "--unchecked",
+        "Skip duration/cost checking and upload eligible MP3s directly",
+    )
     .description(
         "Upload downloaded MP3 files to Sofer one at a time",
     )
     .action(async (csvPath, options) => {
         await transcribeLocal(csvPath, {
             retryUnknown: options.retryUnknown,
+            skipCostCheck: options.unchecked,
         });
     });
 
