@@ -5,6 +5,10 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface } from "node:readline/promises";
+import {
+    AdaptiveEta,
+    BottomStatusLine,
+} from "../lib/adaptiveEta";
 
 type VideoRow = {
     id: string;
@@ -55,9 +59,6 @@ type PendingSubmission = {
     };
 };
 
-const MIN_REQUEST_SPACING_MS = 13_000;
-const ESTIMATED_API_REQUEST_OVERHEAD_MS = 4_000;
-
 type DurationResponse = {
     duration_seconds: number;
 };
@@ -69,15 +70,33 @@ type PreparedSubmission = {
     durationSeconds?: number;
 };
 
+type TimingAverage = {
+    averageMilliseconds: number;
+    sampleCount: number;
+};
+
+type TimingHistory = {
+    durationChecks: TimingAverage;
+    submissions: TimingAverage;
+};
+
+const MIN_REQUEST_SPACING_MS = 13_000;
+const ESTIMATED_API_REQUEST_OVERHEAD_MS = 4_000;
+const DEFAULT_REQUEST_TIME_MS =
+    MIN_REQUEST_SPACING_MS + ESTIMATED_API_REQUEST_OVERHEAD_MS;
 const PRICE_PER_AUDIO_HOUR_USD = 1.20;
+
+const TIMING_HISTORY_PATH = path.resolve(
+    "data",
+    "sofer",
+    "timing-history.json",
+);
 
 function formatDuration(totalSeconds: number): string {
     const roundedSeconds = Math.round(totalSeconds);
-
     const hours = Math.floor(roundedSeconds / 3600);
     const minutes = Math.floor((roundedSeconds % 3600) / 60);
     const seconds = roundedSeconds % 60;
-
     const parts: string[] = [];
 
     if (hours > 0) {
@@ -93,6 +112,30 @@ function formatDuration(totalSeconds: number): string {
     }
 
     return parts.join(", ");
+}
+
+function formatCountdown(milliseconds: number): string {
+    const totalSeconds = Math.max(
+        0,
+        Math.ceil(milliseconds / 1000),
+    );
+
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    if (hours > 0) {
+        return [
+            hours,
+            minutes.toString().padStart(2, "0"),
+            seconds.toString().padStart(2, "0"),
+        ].join(":");
+    }
+
+    return [
+        minutes,
+        seconds.toString().padStart(2, "0"),
+    ].join(":");
 }
 
 function formatUsd(amount: number): string {
@@ -290,10 +333,6 @@ async function waitForRateLimit(
     );
 
     if (waitMilliseconds > 0) {
-        console.log(
-            `Waiting ${Math.ceil(waitMilliseconds / 1000)} seconds before the next Sofer request...`,
-        );
-
         await sleep(waitMilliseconds);
     }
 }
@@ -320,6 +359,110 @@ function validateRows(records: VideoRow[]): void {
 
         ids.add(video.id);
     }
+}
+
+function createDefaultTimingHistory(): TimingHistory {
+    return {
+        durationChecks: {
+            averageMilliseconds: DEFAULT_REQUEST_TIME_MS,
+            sampleCount: 0,
+        },
+        submissions: {
+            averageMilliseconds: DEFAULT_REQUEST_TIME_MS,
+            sampleCount: 0,
+        },
+    };
+}
+
+async function loadTimingHistory(): Promise<TimingHistory> {
+    if (!(await fs.pathExists(TIMING_HISTORY_PATH))) {
+        return createDefaultTimingHistory();
+    }
+
+    try {
+        const value =
+            await fs.readJson(TIMING_HISTORY_PATH) as Partial<TimingHistory>;
+
+        return {
+            durationChecks: {
+                averageMilliseconds:
+                    value.durationChecks?.averageMilliseconds ??
+                    DEFAULT_REQUEST_TIME_MS,
+                sampleCount:
+                    value.durationChecks?.sampleCount ?? 0,
+            },
+            submissions: {
+                averageMilliseconds:
+                    value.submissions?.averageMilliseconds ??
+                    DEFAULT_REQUEST_TIME_MS,
+                sampleCount:
+                    value.submissions?.sampleCount ?? 0,
+            },
+        };
+    } catch {
+        return createDefaultTimingHistory();
+    }
+}
+
+async function saveTimingHistory(
+    history: TimingHistory,
+): Promise<void> {
+    await fs.ensureDir(path.dirname(TIMING_HISTORY_PATH));
+
+    await fs.writeJson(
+        TIMING_HISTORY_PATH,
+        history,
+        {
+            spaces: 2,
+        },
+    );
+}
+
+function updatePersistentAverage(
+    existing: TimingAverage,
+    measuredMilliseconds: number,
+): TimingAverage {
+    const maximumStoredSamples = 20;
+    const effectiveSamples = Math.min(
+        existing.sampleCount,
+        maximumStoredSamples,
+    );
+
+    const newAverage =
+        (
+            existing.averageMilliseconds * effectiveSamples +
+            measuredMilliseconds
+        ) /
+        (effectiveSamples + 1);
+
+    return {
+        averageMilliseconds: newAverage,
+        sampleCount: existing.sampleCount + 1,
+    };
+}
+
+function estimatePhaseMilliseconds(
+    itemCount: number,
+    averageMillisecondsPerItem: number,
+): number {
+    if (itemCount <= 0) {
+        return 0;
+    }
+
+    /*
+     * Historical measurements include pacing on most requests. The first
+     * request in a phase normally has no rate-limit wait, so estimate it
+     * separately instead of charging the full learned average for it.
+     */
+    const estimatedFirstItemMilliseconds = Math.max(
+        ESTIMATED_API_REQUEST_OVERHEAD_MS,
+        averageMillisecondsPerItem - MIN_REQUEST_SPACING_MS,
+    );
+
+    return (
+        estimatedFirstItemMilliseconds +
+        Math.max(0, itemCount - 1) * averageMillisecondsPerItem
+    );
 }
 
 export async function transcribeLocal(
@@ -350,74 +493,21 @@ export async function transcribeLocal(
         "submissions",
     );
 
-    let lastSoferRequestStartedAt = 0;
-
     let alreadySubmittedCount = 0;
     let skippedUnknownCount = 0;
     let missingAudioCount = 0;
 
-    const preparedSubmissions: PreparedSubmission[] = [];
+    const eligibleSubmissions: PreparedSubmission[] = [];
+    const timingHistory = await loadTimingHistory();
 
-    const durationCheckEstimatedSeconds =
-        (
-            Math.max(0, records.length - 1) *
-            MIN_REQUEST_SPACING_MS
-            +
-            records.length *
-            ESTIMATED_API_REQUEST_OVERHEAD_MS
-        ) / 1000;
+    console.log(
+        `Scanning ${records.length} CSV item(s) for eligible local MP3 files...`,
+    );
 
-    const submissionEstimatedSeconds =
-        (
-            Math.max(0, records.length - 1) *
-            MIN_REQUEST_SPACING_MS
-            +
-            records.length *
-            ESTIMATED_API_REQUEST_OVERHEAD_MS
-        ) / 1000;
-
-    const totalEstimatedSeconds =
-        durationCheckEstimatedSeconds +
-        submissionEstimatedSeconds;
-
-    if (options.skipCostCheck) {
-        console.log(
-            `Unchecked mode enabled. Skipping duration checks and cost estimate for ${records.length} CSV item(s).`,
-        );
-
-        console.log(
-            `Estimated time to submit all the audio clips to Sofer.ai: Approximately ${formatDuration(submissionEstimatedSeconds)}.`,
-        );
-    } else {
-        console.log(
-            `Calculating the projected cost for ${records.length} CSV item(s)...`,
-        );
-
-        console.log(
-            `Estimated time to calculate the cost: Approximately ${formatDuration(durationCheckEstimatedSeconds)}.`,
-        );
-
-        console.log(
-            `Estimated time to submit all the audio clips to Sofer.ai: Approximately ${formatDuration(submissionEstimatedSeconds)}.`,
-        );
-
-        console.log(
-            `Estimated total processing time: Approximately ${formatDuration(totalEstimatedSeconds)}.`,
-        );
-
-        const shouldCalculateDurations = await askYesNo(
-            "Continue with duration checks?",
-        );
-
-        if (!shouldCalculateDurations) {
-            console.log(
-                "Cancelled. No duration checks or transcription submissions were made.",
-            );
-
-            return;
-        }
-    }
-
+    /*
+     * Local-only preflight. No Sofer requests are made here. This lets all
+     * estimates and countdown totals use only files that can actually be sent.
+     */
     for (let index = 0; index < records.length; index += 1) {
         const video = records[index];
 
@@ -458,11 +548,7 @@ export async function transcribeLocal(
             )
         ) {
             alreadySubmittedCount += 1;
-
-            console.log(
-                `${progressLabel} — already submitted; excluded from estimate.`,
-            );
-
+            console.log(`${progressLabel} — already submitted; excluded.`);
             continue;
         }
 
@@ -471,11 +557,9 @@ export async function transcribeLocal(
             !options.retryUnknown
         ) {
             skippedUnknownCount += 1;
-
             console.log(
-                `${progressLabel} — prior submission may be uncertain; excluded from estimate.`,
+                `${progressLabel} — prior submission may be uncertain; excluded.`,
             );
-
             continue;
         }
 
@@ -486,99 +570,215 @@ export async function transcribeLocal(
             !options.retryUnknown
         ) {
             skippedUnknownCount += 1;
-
             console.log(
-                `${progressLabel} — prior submission outcome is unknown; excluded from estimate.`,
+                `${progressLabel} — prior submission outcome is unknown; excluded.`,
             );
-
             continue;
         }
 
         if (!(await fs.pathExists(audioPath))) {
             missingAudioCount += 1;
-
-            console.log(
-                `${progressLabel} — MP3 not found; excluded from estimate.`,
-            );
-
+            console.log(`${progressLabel} — MP3 not found; excluded.`);
             continue;
         }
 
         const audioStats = await stat(audioPath);
 
-        if (options.skipCostCheck) {
-            preparedSubmissions.push({
-                video,
-                audioPath,
-                audioSizeBytes: audioStats.size,
-            });
-
-            console.log(
-                `${progressLabel} — ready to upload; duration unchecked.`,
-            );
-
-            continue;
-        }
-
-        console.log(
-            `${progressLabel} — calculating duration...`,
-        );
-
-        const base64Audio = await readFile(audioPath, {
-            encoding: "base64",
-        });
-
-        await waitForRateLimit(lastSoferRequestStartedAt);
-
-        lastSoferRequestStartedAt = Date.now();
-
-        let durationSeconds: number;
-
-        try {
-            durationSeconds = await getAudioDuration(
-                base64Audio,
-                apiKey,
-            );
-        } catch (error) {
-            throw new Error(
-                `Could not calculate duration for ${video.id}: ${video.title}\n` +
-                `${getErrorMessage(error)}\n\n` +
-                "No files were submitted.",
-            );
-        }
-
-        if (durationSeconds <= 0) {
-            throw new Error(
-                `Sofer could not determine the duration for ${video.id}: ${video.title}.\n` +
-                "No files were submitted because the projected total would be incomplete.",
-            );
-        }
-
-        preparedSubmissions.push({
+        eligibleSubmissions.push({
             video,
             audioPath,
             audioSizeBytes: audioStats.size,
-            durationSeconds,
         });
 
-        console.log(
-            `${progressLabel} — ${formatDuration(durationSeconds)}.`,
-        );
+        console.log(`${progressLabel} — eligible.`);
     }
 
-    if (preparedSubmissions.length === 0) {
+    if (eligibleSubmissions.length === 0) {
         console.log("");
         console.log("There are no eligible MP3 files to submit.");
         console.log(`Already submitted: ${alreadySubmittedCount}`);
         console.log(`Unknown prior outcomes skipped: ${skippedUnknownCount}`);
         console.log(`Missing MP3 files skipped: ${missingAudioCount}`);
-
         return;
+    }
+
+    const eligibleCount = eligibleSubmissions.length;
+
+    const durationCheckEstimatedSeconds =
+        estimatePhaseMilliseconds(
+            eligibleCount,
+            timingHistory.durationChecks.averageMilliseconds,
+        ) / 1000;
+
+    const submissionEstimatedSeconds =
+        estimatePhaseMilliseconds(
+            eligibleCount,
+            timingHistory.submissions.averageMilliseconds,
+        ) / 1000;
+
+    const totalEstimatedSeconds = options.skipCostCheck
+        ? submissionEstimatedSeconds
+        : durationCheckEstimatedSeconds + submissionEstimatedSeconds;
+
+    console.log("");
+
+    if (options.skipCostCheck) {
+        console.log(
+            `Unchecked mode enabled. ${eligibleCount} eligible clip(s) will be submitted without duration checks.`,
+        );
+        console.log(
+            `Estimated submission time: Approximately ` +
+            `${formatDuration(submissionEstimatedSeconds)} ` +
+            `(${timingHistory.submissions.sampleCount} prior request sample(s)).`,
+        );
+    } else {
+        console.log(
+            `Calculating the projected cost for ${eligibleCount} eligible clip(s)...`,
+        );
+        console.log(
+            `Estimated time to calculate the cost: Approximately ` +
+            `${formatDuration(durationCheckEstimatedSeconds)} ` +
+            `(${timingHistory.durationChecks.sampleCount} prior request sample(s)).`,
+        );
+        console.log(
+            `Estimated time to submit the clips: Approximately ` +
+            `${formatDuration(submissionEstimatedSeconds)} ` +
+            `(${timingHistory.submissions.sampleCount} prior request sample(s)).`,
+        );
+        console.log(
+            `Estimated total processing time: Approximately ${formatDuration(totalEstimatedSeconds)}.`,
+        );
+
+        const shouldCalculateDurations = await askYesNo(
+            "Continue with duration checks?",
+        );
+
+        if (!shouldCalculateDurations) {
+            console.log(
+                "Cancelled. No duration checks or transcription submissions were made.",
+            );
+            return;
+        }
+    }
+
+    let lastSoferRequestStartedAt = 0;
+    let preparedSubmissions: PreparedSubmission[];
+
+    if (options.skipCostCheck) {
+        preparedSubmissions = [...eligibleSubmissions];
+    } else {
+        const durationCheckedSubmissions: PreparedSubmission[] = [];
+
+        const durationEta = new AdaptiveEta(
+            eligibleCount,
+            timingHistory.durationChecks.averageMilliseconds,
+        );
+
+        const durationStatusLine = new BottomStatusLine();
+
+        durationStatusLine.start(() => {
+            return (
+                `Calculating cost: ` +
+                `${durationEta.getCompletedItems()}/${eligibleCount} | ` +
+                `Estimated remaining: ` +
+                `${formatCountdown(durationEta.getRemainingMilliseconds())}`
+            );
+        });
+
+        try {
+            for (
+                let index = 0;
+                index < eligibleSubmissions.length;
+                index += 1
+            ) {
+                const eligibleSubmission = eligibleSubmissions[index];
+                const {
+                    video,
+                    audioPath,
+                    audioSizeBytes,
+                } = eligibleSubmission;
+
+                const progressLabel =
+                    `[${index + 1}/${eligibleCount}] ${video.id}: ${video.title}`;
+
+                durationStatusLine.log(
+                    `${progressLabel} — calculating duration...`,
+                );
+
+                durationEta.startItem();
+
+                let durationSeconds: number;
+
+                try {
+                    const base64Audio = await readFile(audioPath, {
+                        encoding: "base64",
+                    });
+
+                    await waitForRateLimit(lastSoferRequestStartedAt);
+                    lastSoferRequestStartedAt = Date.now();
+
+                    durationSeconds = await getAudioDuration(
+                        base64Audio,
+                        apiKey,
+                    );
+                } catch (error) {
+                    durationEta.finishItem();
+
+                    throw new Error(
+                        `Could not calculate duration for ${video.id}: ${video.title}\n` +
+                        `${getErrorMessage(error)}\n\n` +
+                        "No files were submitted.",
+                    );
+                }
+
+                if (durationSeconds <= 0) {
+                    durationEta.finishItem();
+
+                    throw new Error(
+                        `Sofer could not determine the duration for ${video.id}: ${video.title}.\n` +
+                        "No files were submitted because the projected total would be incomplete.",
+                    );
+                }
+
+                durationCheckedSubmissions.push({
+                    video,
+                    audioPath,
+                    audioSizeBytes,
+                    durationSeconds,
+                });
+
+                const measuredMilliseconds =
+                    durationEta.finishItem();
+
+                timingHistory.durationChecks =
+                    updatePersistentAverage(
+                        timingHistory.durationChecks,
+                        measuredMilliseconds,
+                    );
+
+                durationStatusLine.log(
+                    `${progressLabel} — ${formatDuration(durationSeconds)}.`,
+                );
+            }
+        } finally {
+            durationStatusLine.stop();
+            await saveTimingHistory(timingHistory);
+        }
+
+        preparedSubmissions = durationCheckedSubmissions;
     }
 
     if (!options.skipCostCheck) {
         const totalDurationSeconds = preparedSubmissions.reduce(
-            (total, submission) => total + submission.durationSeconds,
+            (total, submission) => {
+                if (submission.durationSeconds === undefined) {
+                    throw new Error(
+                        `Duration is missing for ${submission.video.id}.`,
+                    );
+                }
+
+                return total + submission.durationSeconds;
+            },
             0,
         );
 
@@ -588,13 +788,14 @@ export async function transcribeLocal(
          * to the next minute/hour.
          */
         const projectedCost =
-            (totalDurationSeconds / 3600) *
-            PRICE_PER_AUDIO_HOUR_USD;
+            (totalDurationSeconds / 3600) * PRICE_PER_AUDIO_HOUR_USD;
 
         console.log("");
         console.log("Submission preflight complete.");
         console.log(`Clips to submit: ${preparedSubmissions.length}`);
-        console.log(`Total audio duration: ${formatDuration(totalDurationSeconds)}`);
+        console.log(
+            `Total audio duration: ${formatDuration(totalDurationSeconds)}`,
+        );
         console.log(
             `Projected transcription cost: ${formatUsd(projectedCost)} ` +
             `(prorated by exact audio duration at ${formatUsd(PRICE_PER_AUDIO_HOUR_USD)} per audio hour ` +
@@ -610,7 +811,9 @@ export async function transcribeLocal(
     }
 
     if (alreadySubmittedCount > 0) {
-        console.log(`Already submitted and excluded: ${alreadySubmittedCount}`);
+        console.log(
+            `Already submitted and excluded: ${alreadySubmittedCount}`,
+        );
     }
 
     if (skippedUnknownCount > 0) {
@@ -635,7 +838,6 @@ export async function transcribeLocal(
                 ? "Cancelled. No transcription submissions were made."
                 : "Cancelled. No transcription submissions or submission-state files were created.",
         );
-
         return;
     }
 
@@ -650,92 +852,191 @@ export async function transcribeLocal(
         `Submitting ${preparedSubmissions.length} approved clip(s) to Sofer...`,
     );
 
-    for (
-        let index = 0;
-        index < preparedSubmissions.length;
-        index += 1
-    ) {
-        const preparedSubmission = preparedSubmissions[index];
+    const uploadEta = new AdaptiveEta(
+        preparedSubmissions.length,
+        timingHistory.submissions.averageMilliseconds,
+    );
 
-        const {
-            video,
-            audioPath,
-            audioSizeBytes,
-        } = preparedSubmission;
+    const uploadStatusLine = new BottomStatusLine();
 
-        const submissionPath = path.join(
-            submissionDirectory,
-            `${video.id}.json`,
+    uploadStatusLine.start(() => {
+        return (
+            `Uploading: ` +
+            `${uploadEta.getCompletedItems()}/` +
+            `${preparedSubmissions.length} | ` +
+            `Estimated remaining: ` +
+            `${formatCountdown(uploadEta.getRemainingMilliseconds())}`
         );
+    });
 
-        const pendingPath = path.join(
-            submissionDirectory,
-            `${video.id}.pending.json`,
-        );
+    try {
+        for (
+            let index = 0;
+            index < preparedSubmissions.length;
+            index += 1
+        ) {
+            const preparedSubmission = preparedSubmissions[index];
+            const {
+                video,
+                audioPath,
+                audioSizeBytes,
+            } = preparedSubmission;
 
-        const failurePath = path.join(
-            submissionDirectory,
-            `${video.id}.error.json`,
-        );
-
-        const progressLabel =
-            `[${index + 1}/${preparedSubmissions.length}] ${video.id}: ${video.title}`;
-
-        console.log(`${progressLabel} — uploading...`);
-
-        /*
-         * Do not keep every Base64 MP3 in memory from the preflight phase.
-         * Read one file again only when it is actually ready to upload.
-         */
-        const base64Audio = await readFile(audioPath, {
-            encoding: "base64",
-        });
-
-        try {
-            await waitForRateLimit(lastSoferRequestStartedAt);
-
-            const pendingSubmission: PendingSubmission = {
-                status: "pending_submission",
-                requestStartedAt: new Date().toISOString(),
-                source: {
-                    id: video.id,
-                    title: video.title,
-                    url: video.url,
-                    audioPath,
-                    audioSizeBytes,
-                },
-            };
-
-            await fs.writeJson(pendingPath, pendingSubmission, {
-                spaces: 2,
-            });
-
-            lastSoferRequestStartedAt = Date.now();
-
-            const response = await axios.post<unknown>(
-                "https://api.sofer.ai/v1/transcriptions/",
-                {
-                    audio_file: base64Audio,
-                    info: {
-                        model: "v1",
-                        primary_language: "en",
-                        hebrew_word_format: ["en", "he"],
-                        num_speakers: 1,
-                        title: video.title,
-                    },
-                },
-                {
-                    headers: {
-                        Authorization: `Bearer ${apiKey}`,
-                        "Content-Type": "application/json",
-                    },
-                    timeout: 300_000,
-                },
+            const submissionPath = path.join(
+                submissionDirectory,
+                `${video.id}.json`,
             );
 
-            if (typeof response.data !== "string") {
+            const pendingPath = path.join(
+                submissionDirectory,
+                `${video.id}.pending.json`,
+            );
+
+            const failurePath = path.join(
+                submissionDirectory,
+                `${video.id}.error.json`,
+            );
+
+            const progressLabel =
+                `[${index + 1}/${preparedSubmissions.length}] ${video.id}: ${video.title}`;
+
+            uploadStatusLine.log(`${progressLabel} — uploading...`);
+            uploadEta.startItem();
+
+            try {
+                /*
+                 * Read only the current MP3 into memory when it is ready to
+                 * upload. This also keeps file-read time in the live ETA.
+                 */
+                const base64Audio = await readFile(audioPath, {
+                    encoding: "base64",
+                });
+
+                await waitForRateLimit(lastSoferRequestStartedAt);
+
+                const pendingSubmission: PendingSubmission = {
+                    status: "pending_submission",
+                    requestStartedAt: new Date().toISOString(),
+                    source: {
+                        id: video.id,
+                        title: video.title,
+                        url: video.url,
+                        audioPath,
+                        audioSizeBytes,
+                    },
+                };
+
+                await fs.writeJson(pendingPath, pendingSubmission, {
+                    spaces: 2,
+                });
+
+                lastSoferRequestStartedAt = Date.now();
+
+                const response = await axios.post<unknown>(
+                    "https://api.sofer.ai/v1/transcriptions/",
+                    {
+                        audio_file: base64Audio,
+                        info: {
+                            model: "v1",
+                            primary_language: "en",
+                            hebrew_word_format: ["en", "he"],
+                            num_speakers: 1,
+                            title: video.title,
+                        },
+                    },
+                    {
+                        headers: {
+                            Authorization: `Bearer ${apiKey}`,
+                            "Content-Type": "application/json",
+                        },
+                        timeout: 300_000,
+                    },
+                );
+
+                if (typeof response.data !== "string") {
+                    const failure: SubmissionFailure = {
+                        status: "submission_unknown",
+                        recordedAt: new Date().toISOString(),
+                        source: {
+                            id: video.id,
+                            title: video.title,
+                            url: video.url,
+                            audioPath,
+                        },
+                        error:
+                            "Sofer returned an unexpected successful response: " +
+                            JSON.stringify(response.data),
+                    };
+
+                    await fs.writeJson(failurePath, failure, {
+                        spaces: 2,
+                    });
+
+                    unknownFailureCount += 1;
+
+                    const measuredMilliseconds = uploadEta.finishItem();
+                    timingHistory.submissions =
+                        updatePersistentAverage(
+                            timingHistory.submissions,
+                            measuredMilliseconds,
+                        );
+
+                    uploadStatusLine.error(
+                        `${video.id} returned an unexpected response. Its pending marker was retained.`,
+                    );
+                    continue;
+                }
+
+                const transcriptionId = response.data;
+
+                const success: SubmissionSuccess = {
+                    status: "submitted",
+                    transcriptionId,
+                    submittedAt: new Date().toISOString(),
+                    source: {
+                        id: video.id,
+                        title: video.title,
+                        url: video.url,
+                        audioPath,
+                        audioSizeBytes,
+                    },
+                };
+
+                await fs.writeJson(submissionPath, success, {
+                    spaces: 2,
+                });
+
+                await fs.remove(failurePath);
+                await fs.remove(pendingPath);
+
+                submittedCount += 1;
+
+                const measuredMilliseconds = uploadEta.finishItem();
+                timingHistory.submissions =
+                    updatePersistentAverage(
+                        timingHistory.submissions,
+                        measuredMilliseconds,
+                    );
+
+                uploadStatusLine.log(
+                    `${video.id} submitted — transcription ID: ${transcriptionId}`,
+                );
+            } catch (error) {
+                const measuredMilliseconds = uploadEta.finishItem();
+
+                if (measuredMilliseconds > 0) {
+                    timingHistory.submissions =
+                        updatePersistentAverage(
+                            timingHistory.submissions,
+                            measuredMilliseconds,
+                        );
+                }
+
+                const httpStatus = getHttpStatus(error);
+                const failureStatus = getFailureStatus(error);
+
                 const failure: SubmissionFailure = {
-                    status: "submission_unknown",
+                    status: failureStatus,
                     recordedAt: new Date().toISOString(),
                     source: {
                         id: video.id,
@@ -743,88 +1044,33 @@ export async function transcribeLocal(
                         url: video.url,
                         audioPath,
                     },
-                    error:
-                        "Sofer returned an unexpected successful response: " +
-                        JSON.stringify(response.data),
+                    error: getErrorMessage(error),
+                    httpStatus,
                 };
 
                 await fs.writeJson(failurePath, failure, {
                     spaces: 2,
                 });
 
-                unknownFailureCount += 1;
+                if (failureStatus === "rejected") {
+                    await fs.remove(pendingPath);
+                    rejectedCount += 1;
 
-                console.error(
-                    `${video.id} returned an unexpected response. Its pending marker was retained.`,
-                );
+                    uploadStatusLine.error(
+                        `${video.id} was rejected by Sofer${httpStatus ? ` (HTTP ${httpStatus})` : ""}.`,
+                    );
+                } else {
+                    unknownFailureCount += 1;
 
-                continue;
-            }
-
-            const transcriptionId = response.data;
-
-            const success: SubmissionSuccess = {
-                status: "submitted",
-                transcriptionId,
-                submittedAt: new Date().toISOString(),
-                source: {
-                    id: video.id,
-                    title: video.title,
-                    url: video.url,
-                    audioPath,
-                    audioSizeBytes,
-                },
-            };
-
-            await fs.writeJson(submissionPath, success, {
-                spaces: 2,
-            });
-
-            await fs.remove(failurePath);
-            await fs.remove(pendingPath);
-
-            submittedCount += 1;
-
-            console.log(
-                `${video.id} submitted — transcription ID: ${transcriptionId}`,
-            );
-        } catch (error) {
-            const httpStatus = getHttpStatus(error);
-            const failureStatus = getFailureStatus(error);
-
-            const failure: SubmissionFailure = {
-                status: failureStatus,
-                recordedAt: new Date().toISOString(),
-                source: {
-                    id: video.id,
-                    title: video.title,
-                    url: video.url,
-                    audioPath,
-                },
-                error: getErrorMessage(error),
-                httpStatus,
-            };
-
-            await fs.writeJson(failurePath, failure, {
-                spaces: 2,
-            });
-
-            if (failureStatus === "rejected") {
-                await fs.remove(pendingPath);
-
-                rejectedCount += 1;
-
-                console.error(
-                    `${video.id} was rejected by Sofer${httpStatus ? ` (HTTP ${httpStatus})` : ""}.`,
-                );
-            } else {
-                unknownFailureCount += 1;
-
-                console.error(
-                    `${video.id} has an unknown submission outcome${httpStatus ? ` (HTTP ${httpStatus})` : ""}. It will not be retried automatically.`,
-                );
+                    uploadStatusLine.error(
+                        `${video.id} has an unknown submission outcome${httpStatus ? ` (HTTP ${httpStatus})` : ""}. It will not be retried automatically.`,
+                    );
+                }
             }
         }
+    } finally {
+        uploadStatusLine.stop();
+        await saveTimingHistory(timingHistory);
     }
 
     console.log("");
@@ -847,6 +1093,4 @@ export async function transcribeLocal(
     }
 }
 
-//todo proper time estimation
-//todo make a rolling time estimation for both the cost check and the actual uploading and have it count down at the bottom of the console
-//todo make a way to run without installing node locally.
+// TODO: Make a way to run without installing Node locally.
