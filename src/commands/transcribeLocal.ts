@@ -102,7 +102,7 @@ function formatUsd(amount: number): string {
     }).format(amount);
 }
 
-async function askYesNo(question: string): Promise<boolean> {
+export async function askYesNo(question: string): Promise<boolean> {
     const readline = createInterface({
         input,
         output,
@@ -849,3 +849,4 @@ export async function transcribeLocal(
 
 //todo proper time estimation
 //todo make a rolling time estimation for both the cost check and the actual uploading and have it count down at the bottom of the console
+//todo make a way to run without installing node locally.
