@@ -4,6 +4,7 @@ import { downloadVideos } from "./commands/downloadVideos";
 import { transcribeLocal } from "./commands/transcribeLocal";
 import { submitStandardBatch } from "./commands/submitStandardBatch";
 import {checkTranscriptions} from "./commands/checkTranscriptions";
+import {channelToCsv} from "./commands/channelToCsv";
 import "dotenv/config";
 
 const program = new Command();
@@ -12,6 +13,17 @@ program
     .name("youtube-to-soferai")
     .description("Converts YouTube shiurim into readable documents.")
     .version("0.1.0");
+
+program
+    .command("channel-to-csv")
+    .argument("<channelUrl>", "YouTube channel URL")
+    .argument("<outputCsvPath>", "Where to save the generated CSV")
+    .description(
+        "Create a CSV of video titles and links from a YouTube channel (oldest to newest)",
+    )
+    .action(async (channelUrl, outputCsvPath) => {
+        await channelToCsv(channelUrl, outputCsvPath);
+    });
 
 program
     .command("import")
