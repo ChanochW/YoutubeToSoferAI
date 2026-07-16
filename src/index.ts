@@ -6,7 +6,6 @@ import {checkTranscriptions} from "./commands/checkTranscriptions";
 import {channelToCsv} from "./commands/channelToCsv";
 import "dotenv/config";
 import {initProject} from "./commands/init";
-import { ensureLocalBinaries } from "./lib/ensureLocalBinaries";
 
 const program = new Command();
 
@@ -18,15 +17,6 @@ program
 type InitCommandOptions = {
     force?: boolean;
 };
-
-program
-    .command("prepare-binaries")
-    .description("Copy helper binaries into the local bin folder")
-    .action(async () => {
-        const binDirectory = await ensureLocalBinaries();
-
-        console.log(`Prepared helper binaries in ${binDirectory}`);
-    });
 
 program
     .command("init")
