@@ -1,5 +1,4 @@
 import { Command } from "commander";
-import { importVideos } from "./commands/importVideos";
 import { downloadVideos } from "./commands/downloadVideos";
 import { transcribeLocal } from "./commands/transcribeLocal";
 import { submitStandardBatch } from "./commands/submitStandardBatch";
@@ -12,7 +11,7 @@ const program = new Command();
 program
     .name("youtube-to-soferai")
     .description("Converts YouTube shiurim into readable documents.")
-    .version("0.1.0");
+    .version("1.0");
 
 program
     .command("channel-to-csv")
@@ -26,20 +25,17 @@ program
     });
 
 program
-    .command("import")
-    .argument("<csvPath>", "Path to videos CSV")
-    .description("Import a CSV of YouTube videos")
-    .action(async (csvPath) => {
-        await importVideos(csvPath);
-    });
-
-program
     .command("download")
     .argument("<csvPath>", "Path to videos CSV")
     .description("Download YouTube videos as audio files")
     .action(async (csvPath) => {
         await downloadVideos(csvPath);
     });
+
+type TranscribeLocalCommandOptions = {
+    retryUnknown?: boolean;
+    unchecked?: boolean;
+};
 
 program
     .command("transcribe-local")
@@ -55,7 +51,10 @@ program
     .description(
         "Upload downloaded MP3 files to Sofer one at a time",
     )
-    .action(async (csvPath, options) => {
+    .action(async (
+        csvPath: string,
+        options: TranscribeLocalCommandOptions,
+    ) => {
         await transcribeLocal(csvPath, {
             retryUnknown: options.retryUnknown,
             skipCostCheck: options.unchecked,
