@@ -1,8 +1,9 @@
 import axios from "axios";
 import fs from "fs-extra";
+import os from "node:os";
 import path from "node:path";
 import { decode } from "html-entities";
-import {askYesNo} from "./transcribeLocal";
+import { askYesNo } from "./transcribeLocal";
 import {
     Document,
     HeadingLevel,
@@ -10,6 +11,16 @@ import {
     Paragraph,
     TextRun,
 } from "docx";
+
+type TranscriptionStatus =
+    | "RECEIVED"
+    | "PENDING"
+    | "PROCESSING"
+    | "COMPLETED"
+    | "CANCELLED"
+    | "FAILED"
+    | "UPLOADED"
+    | "INSUFFICIENT_FUNDS";
 
 type TranscriptionInfo = {
     id: string;
@@ -38,11 +49,6 @@ type TranscriptionResponse = {
     }>;
 };
 
-type CompletedSubmission = {
-    submission: SubmissionSuccess;
-    submissionPath: string;
-};
-
 type SubmissionSuccess = {
     status: "submitted";
     transcriptionId: string;
@@ -58,17 +64,21 @@ type SubmissionSuccess = {
     lastStatusCheckedAt?: string;
 };
 
-type TranscriptionStatus =
-    | "RECEIVED"
-    | "PENDING"
-    | "PROCESSING"
-    | "COMPLETED"
-    | "CANCELLED"
-    | "FAILED"
-    | "UPLOADED"
-    | "INSUFFICIENT_FUNDS";
+type CompletedSubmission = {
+    submission: SubmissionSuccess;
+    submissionPath: string;
+};
+
+type TranscriptPaths = {
+    baseName: string;
+    directory: string;
+    markdownPath: string;
+    docxPath: string;
+    jsonPath: string;
+};
 
 const MIN_REQUEST_SPACING_MS = 13_000;
+const MAX_FILE_SYSTEM_NAME_LENGTH = 120;
 
 function sleep(milliseconds: number): Promise<void> {
     return new Promise((resolve) => {
@@ -92,7 +102,7 @@ async function waitForRateLimit(
 
     if (waitMilliseconds > 0) {
         console.log(
-            `Waiting ${Math.ceil(waitMilliseconds / 1000)} seconds before the next status request...`,
+            `Waiting ${Math.ceil(waitMilliseconds / 1000)} seconds before the next Sofer request...`,
         );
 
         await sleep(waitMilliseconds);
@@ -136,11 +146,56 @@ function getErrorMessage(error: unknown): string {
     return String(error);
 }
 
-function sanitizeFileName(value: string): string {
-    return value
+function sanitizeFileSystemName(value: string): string {
+    const sanitized = value
         .replace(/[<>:"/\\|?*]/g, "_")
+        .replace(/[\u0000-\u001f]/g, "_")
         .replace(/\s+/g, " ")
-        .trim();
+        .trim()
+        .replace(/[. ]+$/g, "");
+
+    if (sanitized.length === 0) {
+        return "Untitled";
+    }
+
+    return sanitized.slice(0, MAX_FILE_SYSTEM_NAME_LENGTH);
+}
+
+function getTranscriptBaseName(
+    submission: SubmissionSuccess,
+): string {
+    return sanitizeFileSystemName(
+        `${submission.source.id} - ${submission.source.title}`,
+    );
+}
+
+function getTranscriptPaths(
+    transcriptRootDirectory: string,
+    submission: SubmissionSuccess,
+): TranscriptPaths {
+    const baseName = getTranscriptBaseName(submission);
+
+    const directory = path.join(
+        transcriptRootDirectory,
+        baseName,
+    );
+
+    return {
+        baseName,
+        directory,
+        markdownPath: path.join(
+            directory,
+            `${baseName}.md`,
+        ),
+        docxPath: path.join(
+            directory,
+            `${baseName}.docx`,
+        ),
+        jsonPath: path.join(
+            directory,
+            `${baseName}.json`,
+        ),
+    };
 }
 
 async function getTranscription(
@@ -158,6 +213,75 @@ async function getTranscription(
     );
 
     return response.data as TranscriptionResponse;
+}
+
+function createFormattedRuns(text: string): TextRun[] {
+    const decodedText = decode(text);
+
+    const runs: TextRun[] = [];
+    const pattern = /<i>(.*?)<\/i>/gis;
+
+    let currentIndex = 0;
+
+    for (const match of decodedText.matchAll(pattern)) {
+        const matchIndex = match.index;
+
+        const normalText = decodedText.slice(
+            currentIndex,
+            matchIndex,
+        );
+
+        if (normalText) {
+            runs.push(
+                new TextRun({
+                    text: normalText,
+                }),
+            );
+        }
+
+        const italicText = match[1];
+
+        if (italicText) {
+            runs.push(
+                new TextRun({
+                    text: italicText,
+                    italics: true,
+                }),
+            );
+        }
+
+        currentIndex = matchIndex + match[0].length;
+    }
+
+    const remainingText = decodedText.slice(currentIndex);
+
+    if (remainingText) {
+        runs.push(
+            new TextRun({
+                text: remainingText,
+            }),
+        );
+    }
+
+    return runs;
+}
+
+function createTranscriptParagraphs(
+    transcriptionText: string,
+): Paragraph[] {
+    return transcriptionText
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .map(
+            (line) =>
+                new Paragraph({
+                    children: createFormattedRuns(line),
+                    spacing: {
+                        after: 160,
+                    },
+                }),
+        );
 }
 
 async function createTranscriptDocx(
@@ -250,73 +374,24 @@ async function createTranscriptDocx(
     await fs.writeFile(outputPath, buffer);
 }
 
-function createFormattedRuns(text: string): TextRun[] {
-    const decodedText = decode(text);
-
-    const runs: TextRun[] = [];
-    const pattern = /<i>(.*?)<\/i>/gis;
-
-    let currentIndex = 0;
-
-    for (const match of decodedText.matchAll(pattern)) {
-        const matchIndex = match.index;
-
-        const normalText = decodedText.slice(
-            currentIndex,
-            matchIndex,
-        );
-
-        if (normalText) {
-            runs.push(
-                new TextRun({
-                    text: normalText,
-                }),
-            );
-        }
-
-        const italicText = match[1];
-
-        if (italicText) {
-            runs.push(
-                new TextRun({
-                    text: italicText,
-                    italics: true,
-                }),
-            );
-        }
-
-        currentIndex = matchIndex + match[0].length;
-    }
-
-    const remainingText = decodedText.slice(currentIndex);
-
-    if (remainingText) {
-        runs.push(
-            new TextRun({
-                text: remainingText,
-            }),
-        );
-    }
-
-    return runs;
-}
-
-function createTranscriptParagraphs(
-    transcriptionText: string,
-): Paragraph[] {
-    return transcriptionText
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0)
-        .map(
-            (line) =>
-                new Paragraph({
-                    children: createFormattedRuns(line),
-                    spacing: {
-                        after: 160,
-                    },
-                }),
-        );
+function createMarkdownContents(
+    submission: SubmissionSuccess,
+    transcription: TranscriptionResponse,
+): string {
+    return (
+        `# ${submission.source.title}\n\n` +
+        `- Source ID: ${submission.source.id}\n` +
+        `- Source URL: ${submission.source.url}\n` +
+        `- Sofer transcription ID: ${submission.transcriptionId}\n` +
+        `- Duration: ${
+            transcription.info.duration !== null
+                ? `${transcription.info.duration} seconds`
+                : "Unknown"
+        }\n` +
+        `- Model: ${transcription.info.model}\n\n` +
+        `---\n\n` +
+        `${transcription.text.trim()}\n`
+    );
 }
 
 export async function checkTranscriptions(): Promise<void> {
@@ -359,12 +434,11 @@ export async function checkTranscriptions(): Promise<void> {
     let lastRequestStartedAt = 0;
 
     const statusCounts = new Map<string, number>();
+    const completedSubmissions: CompletedSubmission[] = [];
 
     console.log(
         `Checking ${submissionFiles.length} saved transcription(s)...`,
     );
-
-    const completedSubmissions: CompletedSubmission[] = [];
 
     for (let index = 0; index < submissionFiles.length; index += 1) {
         const fileName = submissionFiles[index];
@@ -457,42 +531,30 @@ export async function checkTranscriptions(): Promise<void> {
 
     if (completedSubmissions.length === 0) {
         console.log("");
-        console.log("No completed transcriptions are currently available to download.");
+        console.log(
+            "No completed transcriptions are currently available to download.",
+        );
         return;
     }
 
-    const transcriptDirectory = path.resolve(
-        "data",
-        "sofer",
-        "transcripts",
+    const transcriptDirectory = path.join(
+        os.homedir(),
+        "Downloads",
+        "SoferAiTranscripts",
     );
 
     const downloadableSubmissions: CompletedSubmission[] = [];
 
     for (const completedSubmission of completedSubmissions) {
-        const transcriptId = sanitizeFileName(
-            completedSubmission.submission.source.id,
-        );
-
-        const markdownPath = path.join(
+        const paths = getTranscriptPaths(
             transcriptDirectory,
-            `${transcriptId}.md`,
-        );
-
-        const jsonPath = path.join(
-            transcriptDirectory,
-            `${transcriptId}.json`,
-        );
-
-        const docxPath = path.join(
-            transcriptDirectory,
-            `${transcriptId}.docx`,
+            completedSubmission.submission,
         );
 
         const alreadyDownloaded =
-            await fs.pathExists(markdownPath) &&
-            await fs.pathExists(docxPath) &&
-            await fs.pathExists(jsonPath);
+            await fs.pathExists(paths.markdownPath) &&
+            await fs.pathExists(paths.docxPath) &&
+            await fs.pathExists(paths.jsonPath);
 
         if (!alreadyDownloaded) {
             downloadableSubmissions.push(completedSubmission);
@@ -514,6 +576,7 @@ export async function checkTranscriptions(): Promise<void> {
 
     if (downloadableSubmissions.length === 0) {
         console.log("All completed transcriptions are already downloaded.");
+        console.log(`Saved to: ${transcriptDirectory}`);
         return;
     }
 
@@ -542,24 +605,9 @@ export async function checkTranscriptions(): Promise<void> {
     ) {
         const completedSubmission = downloadableSubmissions[index];
         const submission = completedSubmission.submission;
-
-        const fileName = sanitizeFileName(
-            `${submission.source.id} - ${submission.source.title}`,
-        );
-
-        const markdownPath = path.join(
+        const paths = getTranscriptPaths(
             transcriptDirectory,
-            `${fileName}.md`,
-        );
-
-        const jsonPath = path.join(
-            transcriptDirectory,
-            `${fileName}.json`,
-        );
-
-        const docxPath = path.join(
-            transcriptDirectory,
-            `${fileName}.docx`,
+            submission,
         );
 
         console.log(
@@ -585,36 +633,27 @@ export async function checkTranscriptions(): Promise<void> {
                 continue;
             }
 
+            await fs.ensureDir(paths.directory);
+
             await fs.writeJson(
-                jsonPath,
+                paths.jsonPath,
                 transcription,
                 {
                     spaces: 2,
                 },
             );
 
-            const markdownContents =
-                `# ${submission.source.title}\n\n` +
-                `- Source ID: ${submission.source.id}\n` +
-                `- Source URL: ${submission.source.url}\n` +
-                `- Sofer transcription ID: ${submission.transcriptionId}\n` +
-                `- Duration: ${
-                    transcription.info.duration !== null
-                        ? `${transcription.info.duration} seconds`
-                        : "Unknown"
-                }\n` +
-                `- Model: ${transcription.info.model}\n\n` +
-                `---\n\n` +
-                `${transcription.text.trim()}\n`;
-
             await fs.writeFile(
-                markdownPath,
-                markdownContents,
+                paths.markdownPath,
+                createMarkdownContents(
+                    submission,
+                    transcription,
+                ),
                 "utf-8",
             );
 
             await createTranscriptDocx(
-                docxPath,
+                paths.docxPath,
                 submission,
                 transcription,
             );
@@ -636,7 +675,7 @@ export async function checkTranscriptions(): Promise<void> {
             downloadedCount += 1;
 
             console.log(
-                `${submission.source.id} downloaded successfully.`,
+                `${submission.source.id} downloaded successfully to ${paths.directory}.`,
             );
         } catch (error) {
             failedDownloadCount += 1;
