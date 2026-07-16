@@ -2,11 +2,11 @@ import fs from "fs-extra";
 import path from "node:path";
 import {parse} from "csv-parse/sync";
 import youtubedl from "youtube-dl-exec";
-import ffmpegPath from "ffmpeg-static";
-import ffprobePath from "ffprobe-static-installer";
+import { getBundledBinaryPath } from "../lib/appPaths";
 import cliProgress from "cli-progress";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import {ensureBinariesAvailable} from "../lib/ensureBinariesAvailable";
 
 type VideoRow = {
     id: string;
@@ -14,31 +14,32 @@ type VideoRow = {
     url: string;
 };
 
-async function prepareFfmpegTools(): Promise<string> {
-    if (ffmpegPath === null) {
-        throw new Error("Could not find the project-local ffmpeg binary.");
-    }
-
-    if (ffprobePath === null) {
-        throw new Error("Could not find the project-local ffprobe binary.");
-    }
-
-    const ffmpegBinaryPath = ffmpegPath!;
-    const ffprobeBinaryPath = ffprobePath!;
-
-    const toolsDir = path.resolve("tools", "ffmpeg");
-
-    await fs.ensureDir(toolsDir);
-
-    await fs.copyFile(
-        ffmpegBinaryPath,
-        path.join(toolsDir, path.basename(ffmpegBinaryPath)),
+async function getFfmpegToolsDirectory(): Promise<string> {
+    const toolsDir = path.dirname(
+        getBundledBinaryPath("ffmpeg.exe"),
     );
 
-    await fs.copyFile(
-        ffprobeBinaryPath,
-        path.join(toolsDir, path.basename(ffprobeBinaryPath)),
+    const ffmpegBinaryPath = path.join(
+        toolsDir,
+        "ffmpeg.exe",
     );
+
+    const ffprobeBinaryPath = path.join(
+        toolsDir,
+        "ffprobe.exe",
+    );
+
+    if (!(await fs.pathExists(ffmpegBinaryPath))) {
+        throw new Error(
+            `Missing ffmpeg.exe at ${ffmpegBinaryPath}`,
+        );
+    }
+
+    if (!(await fs.pathExists(ffprobeBinaryPath))) {
+        throw new Error(
+            `Missing ffprobe.exe at ${ffprobeBinaryPath}`,
+        );
+    }
 
     return toolsDir;
 }
@@ -105,7 +106,19 @@ export async function downloadVideos(csvPath: string) {
 
     await fs.ensureDir("downloads/audio");
 
-    const ffmpegLocation = await prepareFfmpegTools();
+    await ensureBinariesAvailable();
+
+    const ffmpegLocation = await getFfmpegToolsDirectory();
+
+    const ytDlpPath = getBundledBinaryPath("yt-dlp.exe");
+
+    if (!(await fs.pathExists(ytDlpPath))) {
+        throw new Error(
+            `Missing yt-dlp.exe at ${ytDlpPath}`,
+        );
+    }
+
+    const ytDlp = youtubedl.create(ytDlpPath);
 
     const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let spinnerIndex = 0;
@@ -150,7 +163,7 @@ export async function downloadVideos(csvPath: string) {
                 const outputPath = `downloads/audio/${video.id}.%(ext)s`;
 
                 try {
-                    await youtubedl(video.url, {
+                    await ytDlp(video.url, {
                         extractAudio: true,
                         audioFormat: "mp3",
                         audioQuality: 0,

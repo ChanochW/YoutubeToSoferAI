@@ -1,6 +1,8 @@
 import fs from "fs-extra";
 import path from "node:path";
 import youtubedl from "youtube-dl-exec";
+import { getBundledBinaryPath } from "../lib/appPaths";
+import {ensureBinariesAvailable} from "../lib/ensureBinariesAvailable";
 
 type YoutubeFlatEntry = {
     id?: string;
@@ -53,7 +55,13 @@ export async function channelToCsv(
     console.log(`Reading YouTube channel: ${channelUrl}`);
     console.log("Fetching video list without downloading videos...");
 
-    const result = await youtubedl(channelUrl, {
+    await ensureBinariesAvailable();
+
+    const ytDlp = youtubedl.create(
+        getBundledBinaryPath("yt-dlp.exe"),
+    );
+
+    const result = await ytDlp(channelUrl, {
         dumpSingleJson: true,
         flatPlaylist: true,
         skipDownload: true,
