@@ -9,8 +9,11 @@ node_modules/
 # Build output
 dist/
 dist-portable/
+release/
+production/
 *.exe
 *.blob
+*.zip
 
 bin/
 bin/*.exe

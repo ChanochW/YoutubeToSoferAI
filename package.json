@@ -4,11 +4,12 @@
   "description": "Converts YouTube shiurim into readable documents.",
   "main": "index.js",
   "scripts": {
+    "prepare:binaries": "node scripts/prepare-binaries.mjs",
     "build:bundle": "node scripts/build-bundle.mjs",
     "start:bundle": "node dist/app.cjs",
     "build:exe": "npm run build:bundle && node scripts/build-exe.mjs",
+    "package:release": "npm run build:exe && node scripts/package-release.mjs",
     "dev": "tsx src/index.ts",
-    "prepare:binaries": "node scripts/prepare-binaries.mjs",
     "channel-to-csv": "tsx src/index.ts channel-to-csv \"https://www.youtube.com/@rabbialankimche491\" data/videos.csv",
     "download": "tsx src/index.ts download data/videos.csv",
     "transcribe-local": "tsx src/index.ts transcribe-local data/videos.csv",
