@@ -5,6 +5,7 @@ import { submitStandardBatch } from "./commands/submitStandardBatch";
 import {checkTranscriptions} from "./commands/checkTranscriptions";
 import {channelToCsv} from "./commands/channelToCsv";
 import "dotenv/config";
+import {initProject} from "./commands/init";
 
 const program = new Command();
 
@@ -12,6 +13,29 @@ program
     .name("youtube-to-soferai")
     .description("Converts YouTube shiurim into readable documents.")
     .version("1.0");
+
+type InitCommandOptions = {
+    force?: boolean;
+};
+
+program
+    .command("init")
+    .argument("<apiKey>", "Your Sofer.ai API key")
+    .option(
+        "--force",
+        "Replace the existing SOFER_API_KEY in .env if one already exists",
+    )
+    .description(
+        "Create or update the .env file with your Sofer.ai API key",
+    )
+    .action(async (
+        apiKey: string,
+        options: InitCommandOptions,
+    ) => {
+        await initProject(apiKey, {
+            force: options.force,
+        });
+    });
 
 program
     .command("channel-to-csv")

@@ -325,18 +325,6 @@ async function createTranscriptDocx(
                     new Paragraph({
                         children: [
                             new TextRun({
-                                text: "Sofer transcription ID: ",
-                                bold: true,
-                            }),
-                            new TextRun(
-                                submission.transcriptionId,
-                            ),
-                        ],
-                    }),
-
-                    new Paragraph({
-                        children: [
-                            new TextRun({
                                 text: "Duration: ",
                                 bold: true,
                             }),
@@ -382,7 +370,6 @@ function createMarkdownContents(
         `# ${submission.source.title}\n\n` +
         `- Source ID: ${submission.source.id}\n` +
         `- Source URL: ${submission.source.url}\n` +
-        `- Sofer transcription ID: ${submission.transcriptionId}\n` +
         `- Duration: ${
             transcription.info.duration !== null
                 ? `${transcription.info.duration} seconds`
@@ -396,6 +383,14 @@ function createMarkdownContents(
 
 export async function checkTranscriptions(): Promise<void> {
     const apiKey = process.env.SOFER_API_KEY;
+
+    console.log(
+        `Using SOFER_API_KEY: ${
+            apiKey
+                ? `${apiKey.slice(0, 4)}...${apiKey.slice(-4)}`
+                : "missing"
+        }`,
+    );
 
     if (!apiKey) {
         throw new Error(

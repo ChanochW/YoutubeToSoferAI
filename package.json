@@ -5,7 +5,6 @@
   "main": "index.js",
   "scripts": {
     "dev": "tsx src/index.ts",
-    "import": "tsx src/index.ts import data/videos.csv",
     "channel-to-csv": "tsx src/index.ts channel-to-csv \"https://www.youtube.com/@rabbialankimche491\" data/videos.csv",
     "download": "tsx src/index.ts download data/videos.csv",
     "transcribe-local": "tsx src/index.ts transcribe-local data/videos.csv",

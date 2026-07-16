@@ -590,7 +590,7 @@ export async function transcribeLocal(
             audioSizeBytes: audioStats.size,
         });
 
-        console.log(`${progressLabel} — eligible.`);
+        //console.log(`${progressLabel} — eligible.`);
     }
 
     if (eligibleSubmissions.length === 0) {
@@ -1019,7 +1019,7 @@ export async function transcribeLocal(
                     );
 
                 uploadStatusLine.log(
-                    `${video.id} submitted — transcription ID: ${transcriptionId}`,
+                    `${video.id} submitted — transcription ID saved locally.`,
                 );
             } catch (error) {
                 const measuredMilliseconds = uploadEta.finishItem();
