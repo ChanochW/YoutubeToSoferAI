@@ -1,17 +1,22 @@
 import fs from "fs-extra";
 import path from "node:path";
-import {parse} from "csv-parse/sync";
+import { parse } from "csv-parse/sync";
 import youtubedl from "youtube-dl-exec";
 import { getBundledBinaryPath } from "../lib/appPaths";
 import cliProgress from "cli-progress";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import {ensureBinariesAvailable} from "../lib/ensureBinariesAvailable";
+import { ensureBinariesAvailable } from "../lib/ensureBinariesAvailable";
 
 type VideoRow = {
     id: string;
     title: string;
     url: string;
+};
+
+type FailedDownload = {
+    video: VideoRow;
+    error: string;
 };
 
 async function getFfmpegToolsDirectory(): Promise<string> {
@@ -50,40 +55,46 @@ async function askYesNo(question: string): Promise<boolean> {
         output,
     });
 
-    while (true) {
-        const answer = await readline.question(`${question} (y/n): `);
-        const normalizedAnswer = answer.trim().toLowerCase();
+    try {
+        while (true) {
+            const answer = await readline.question(`${question} (y/n): `);
+            const normalizedAnswer = answer.trim().toLowerCase();
 
-        if (normalizedAnswer === "y" || normalizedAnswer === "yes") {
-            readline.close();
-            return true;
+            if (normalizedAnswer === "y" || normalizedAnswer === "yes") {
+                return true;
+            }
+
+            if (normalizedAnswer === "n" || normalizedAnswer === "no") {
+                return false;
+            }
+
+            console.log("Please enter y or n.");
         }
-
-        if (normalizedAnswer === "n" || normalizedAnswer === "no") {
-            readline.close();
-            return false;
-        }
-
-        console.log("Please enter y or n.");
+    } finally {
+        readline.close();
     }
 }
 
+function formatCsvField(value: string): string {
+    return `"${value.replaceAll('"', '""')}"`;
+}
+
 async function saveFailedVideos(
-    failedVideos: VideoRow[],
+    failedDownloads: FailedDownload[],
     failureCsvPath: string,
 ): Promise<void> {
-    if (failedVideos.length === 0) {
+    if (failedDownloads.length === 0) {
         await fs.remove(failureCsvPath);
         return;
     }
 
     const csvLines = [
         "id,title,url",
-        ...failedVideos.map((video) =>
+        ...failedDownloads.map((failedDownload) =>
             [
-                video.id,
-                `"${video.title.replaceAll('"', '""')}"`,
-                `"${video.url.replaceAll('"', '""')}"`,
+                failedDownload.video.id,
+                formatCsvField(failedDownload.video.title),
+                formatCsvField(failedDownload.video.url),
             ].join(","),
         ),
     ];
@@ -93,6 +104,109 @@ async function saveFailedVideos(
         `${csvLines.join("\n")}\n`,
         "utf-8",
     );
+}
+
+async function saveFailedDownloadErrors(
+    failedDownloads: FailedDownload[],
+    failureErrorPath: string,
+): Promise<void> {
+    if (failedDownloads.length === 0) {
+        await fs.remove(failureErrorPath);
+        return;
+    }
+
+    const failedClipList = [
+        "Failed clips:",
+        "",
+        ...failedDownloads.map((failedDownload) =>
+            `${failedDownload.video.id}: ${failedDownload.video.title}`,
+        ),
+        "",
+        "========================================",
+        "",
+        "Download errors:",
+        "",
+    ].join("\n");
+
+    const errorDetails = failedDownloads
+        .map((failedDownload, index) => {
+            return [
+                `#${index + 1}`,
+                `ID: ${failedDownload.video.id}`,
+                `Title: ${failedDownload.video.title}`,
+                `URL: ${failedDownload.video.url}`,
+                "",
+                "Error:",
+                failedDownload.error,
+                "",
+                "----------------------------------------",
+                "",
+            ].join("\n");
+        })
+        .join("\n");
+
+    await fs.writeFile(
+        failureErrorPath,
+        `${failedClipList}${errorDetails}`,
+        "utf-8",
+    );
+}
+
+function formatDownloadError(error: unknown): string {
+    if (error instanceof Error) {
+        const possibleExecError = error as Error & {
+            stderr?: string;
+            stdout?: string;
+            code?: string | number;
+            errno?: number;
+            path?: string;
+        };
+
+        const details: string[] = [];
+
+        if (possibleExecError.stderr?.trim()) {
+            details.push(possibleExecError.stderr.trim());
+        }
+
+        if (possibleExecError.stdout?.trim()) {
+            details.push(possibleExecError.stdout.trim());
+        }
+
+        if (possibleExecError.message.trim()) {
+            details.push(possibleExecError.message.trim());
+        }
+
+        if (possibleExecError.code !== undefined) {
+            details.push(`Code: ${possibleExecError.code}`);
+        }
+
+        if (possibleExecError.errno !== undefined) {
+            details.push(`Errno: ${possibleExecError.errno}`);
+        }
+
+        if (possibleExecError.path !== undefined) {
+            details.push(`Path: ${possibleExecError.path}`);
+        }
+
+        return details.join("\n");
+    }
+
+    return String(error);
+}
+
+function printFailureSummary(
+    failedDownloads: FailedDownload[],
+    failureCsvPath: string,
+    failureErrorPath: string,
+): void {
+    if (failedDownloads.length === 0) {
+        return;
+    }
+
+    console.error("");
+    console.error(`${failedDownloads.length} download(s) failed.`);
+    console.error(`Failed video retry CSV saved to ${failureCsvPath}.`);
+    console.error(`Full failure details saved to ${failureErrorPath}.`);
 }
 
 export async function downloadVideos(csvPath: string) {
@@ -124,18 +238,19 @@ export async function downloadVideos(csvPath: string) {
     let spinnerIndex = 0;
 
     const failureCsvPath = "data/failed-downloads.csv";
+    const failureErrorPath = "data/failed-download-errors.txt";
 
     await fs.ensureDir("data");
 
     async function downloadPass(
         videos: VideoRow[],
         passName: string,
-    ): Promise<VideoRow[]> {
+    ): Promise<FailedDownload[]> {
         let processedCount = 0;
         let successfulCount = 0;
         let failedCount = 0;
 
-        const failedVideos: VideoRow[] = [];
+        const failedDownloads: FailedDownload[] = [];
 
         const progressBar = new cliProgress.SingleBar(
             {
@@ -170,7 +285,6 @@ export async function downloadVideos(csvPath: string) {
                         output: outputPath,
                         noPlaylist: true,
                         ffmpegLocation,
-                        noJsRuntimes: true,
                         jsRuntimes: "node",
                         noOverwrites: true,
                     });
@@ -182,7 +296,10 @@ export async function downloadVideos(csvPath: string) {
                         spinner: spinnerFrames[spinnerIndex],
                     });
                 } catch (error) {
-                    failedVideos.push(video);
+                    failedDownloads.push({
+                        video,
+                        error: formatDownloadError(error),
+                    });
 
                     failedCount += 1;
                     processedCount += 1;
@@ -197,27 +314,33 @@ export async function downloadVideos(csvPath: string) {
             progressBar.stop();
         }
 
-        if (failedVideos.length > 0) {
-            console.error(
-                `Failed clips: ${failedVideos
-                    .map((video) => `${video.id}: ${video.title}`)
-                    .join(", ")}`,
-            );
-        }
+        await saveFailedVideos(
+            failedDownloads,
+            failureCsvPath,
+        );
+
+        await saveFailedDownloadErrors(
+            failedDownloads,
+            failureErrorPath,
+        );
+
+        printFailureSummary(
+            failedDownloads,
+            failureCsvPath,
+            failureErrorPath,
+        );
 
         console.log(
             `${passName} complete: ${successfulCount} succeeded, ${failedCount} failed.`,
         );
 
-        return failedVideos;
+        return failedDownloads;
     }
 
     let remainingFailures = await downloadPass(
         records,
         "Downloading videos",
     );
-
-    await saveFailedVideos(remainingFailures, failureCsvPath);
 
     let retryNumber = 1;
 
@@ -231,15 +354,17 @@ export async function downloadVideos(csvPath: string) {
                 `Finished. ${remainingFailures.length} failed download(s) were saved to ${failureCsvPath}.`,
             );
 
+            console.log(
+                `Failure details were saved to ${failureErrorPath}.`,
+            );
+
             return;
         }
 
         remainingFailures = await downloadPass(
-            remainingFailures,
+            remainingFailures.map((failedDownload) => failedDownload.video),
             `Retrying failed downloads (attempt ${retryNumber})`,
         );
-
-        await saveFailedVideos(remainingFailures, failureCsvPath);
 
         retryNumber += 1;
     }

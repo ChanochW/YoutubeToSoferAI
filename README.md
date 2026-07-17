@@ -142,6 +142,13 @@ Download audio:
 tsx src/index.ts download data/videos.csv
 ```
 
+Note: Large YouTube batches may not finish in one pass. If some downloads fail, retry with:
+
+```powershell
+.\YouTubeToSoferAI.exe download data/failed-downloads.csv
+```
+
+
 Upload local MP3 files to Sofer.ai:
 
 ```powershell
@@ -365,3 +372,43 @@ Builds the portable app and creates a production zip in the `production/` folder
 The generated executable is not code-signed. Windows or antivirus software may warn the user before running it.
 
 This is common for custom unsigned executables.
+
+## Download Reliability and YouTube Bot Detection
+
+The `download` command may take multiple attempts to finish a large batch.
+
+YouTube sometimes blocks or interrupts automated download requests because tools like `yt-dlp` can look like bot traffic. When that happens, some videos may fail with errors such as:
+
+```text
+Sign in to confirm you're not a bot
+```
+
+or with network/read timeout errors.
+
+This does not necessarily mean the app is broken. It usually means YouTube temporarily rejected or interrupted some of the download requests.
+
+When downloads fail, the app saves two files:
+
+```text
+data/failed-downloads.csv
+data/failed-download-errors.txt
+```
+
+`data/failed-downloads.csv` is a clean retry file containing only the videos that failed. You can retry only those failed videos by running:
+
+```powershell
+.\YouTubeToSoferAI.exe download data/failed-downloads.csv
+```
+
+`data/failed-download-errors.txt` contains the detailed `yt-dlp` error messages for debugging.
+
+For large channels, it is normal to need several rounds of retries:
+
+```text
+First run: downloads most videos, some fail
+Second run: retry data/failed-downloads.csv
+Third run: retry the remaining failures again
+```
+
+If many videos fail because YouTube asks to confirm you are not a bot, wait a while and retry later. In some cases, cookie-based authentication may be needed, we may add support for this in a future update.
+
