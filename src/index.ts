@@ -48,12 +48,19 @@ program
         await channelToCsv(channelUrl, outputCsvPath);
     });
 
+type DownloadCommandOptions = {
+    force?: boolean;
+};
+
 program
     .command("download")
-    .argument("<csvPath>", "Path to videos CSV")
+    .argument("<csvPath>", "Path to the videos CSV")
+    .option("--force", "Keep retrying failed downloads without asking")
     .description("Download YouTube videos as audio files")
-    .action(async (csvPath) => {
-        await downloadVideos(csvPath);
+    .action(async (csvPath: string, options: DownloadCommandOptions) => {
+        await downloadVideos(csvPath, {
+            force: options.force,
+        });
     });
 
 type TranscribeLocalCommandOptions = {

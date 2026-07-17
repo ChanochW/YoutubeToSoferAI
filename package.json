@@ -12,6 +12,7 @@
     "dev": "tsx src/index.ts",
     "channel-to-csv": "tsx src/index.ts channel-to-csv \"https://www.youtube.com/@rabbialankimche491\" data/videos.csv",
     "download": "tsx src/index.ts download data/videos.csv",
+    "download-failed": "tsx src/index.ts download data/failed-downloads.csv",
     "transcribe-local": "tsx src/index.ts transcribe-local data/videos.csv",
     "check-transcriptions": "tsx src/index.ts check-transcriptions",
     "test": "echo \"Error: no test specified\" && exit 1"

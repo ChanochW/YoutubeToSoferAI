@@ -19,6 +19,10 @@ type FailedDownload = {
     error: string;
 };
 
+type DownloadVideosOptions = {
+    force?: boolean;
+};
+
 async function getFfmpegToolsDirectory(): Promise<string> {
     const toolsDir = path.dirname(
         getBundledBinaryPath("ffmpeg.exe"),
@@ -209,7 +213,10 @@ function printFailureSummary(
     console.error(`Full failure details saved to ${failureErrorPath}.`);
 }
 
-export async function downloadVideos(csvPath: string) {
+export async function downloadVideos(
+    csvPath: string,
+    options: DownloadVideosOptions = {},
+) {
     const csv = await fs.readFile(csvPath, "utf-8");
 
     const records = parse(csv, {
@@ -345,20 +352,26 @@ export async function downloadVideos(csvPath: string) {
     let retryNumber = 1;
 
     while (remainingFailures.length > 0) {
-        const shouldRetry = await askYesNo(
-            `Retry ${remainingFailures.length} failed download(s)?`,
-        );
-
-        if (!shouldRetry) {
-            console.log(
-                `Finished. ${remainingFailures.length} failed download(s) were saved to ${failureCsvPath}.`,
+        if (!options.force) {
+            const shouldRetry = await askYesNo(
+                `Retry ${remainingFailures.length} failed download(s)?`,
             );
 
-            console.log(
-                `Failure details were saved to ${failureErrorPath}.`,
-            );
+            if (!shouldRetry) {
+                console.log(
+                    `Finished. ${remainingFailures.length} failed download(s) were saved to ${failureCsvPath}.`,
+                );
 
-            return;
+                console.log(
+                    `Failure details were saved to ${failureErrorPath}.`,
+                );
+
+                return;
+            }
+        } else {
+            console.log(
+                `Force retry enabled. Retrying ${remainingFailures.length} failed download(s)...`,
+            );
         }
 
         remainingFailures = await downloadPass(

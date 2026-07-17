@@ -412,3 +412,69 @@ Third run: retry the remaining failures again
 
 If many videos fail because YouTube asks to confirm you are not a bot, wait a while and retry later. In some cases, cookie-based authentication may be needed, we may add support for this in a future update.
 
+### Automatic Download Retries with `--force`
+
+By default, the `download` command asks before retrying failed downloads:
+
+```powershell
+.\YouTubeToSoferAI.exe download data/videos.csv
+```
+
+If some videos fail, the app will ask:
+
+```text
+Retry 64 failed download(s)? (y/n):
+```
+
+You can answer `y` to retry only the failed videos, or `n` to stop and retry later.
+
+To skip the prompt and keep retrying failed downloads automatically, use the `--force` flag:
+
+```powershell
+.\YouTubeToSoferAI.exe download data/videos.csv --force
+```
+
+With `--force`, the app does **not** redownload videos that already succeeded. It only retries the videos that failed in the previous pass.
+
+Example flow:
+
+```text
+First pass: 269 videos
+→ 205 succeeded, 64 failed
+
+Retry pass 1:
+→ retries only the 64 failed videos
+
+Retry pass 2:
+→ retries only the videos still failing
+```
+
+This can be useful for large batches where YouTube interrupts some downloads due to network errors or bot-detection checks.
+
+However, if YouTube is repeatedly returning errors like:
+
+```text
+Sign in to confirm you're not a bot
+```
+
+then automatic retries may not solve the problem right away. In that case, it may be better to stop the command with `Ctrl+C`, wait a while, and retry later:
+
+```powershell
+.\YouTubeToSoferAI.exe download data/failed-downloads.csv
+```
+
+The app saves failed videos here:
+
+```text
+data/failed-downloads.csv
+```
+
+and detailed error information here:
+
+```text
+data/failed-download-errors.txt
+```
+
+Use `--force` when you want the app to keep retrying without asking, but remember that YouTube bot-detection failures may require waiting before the downloads start working again.
+
+
