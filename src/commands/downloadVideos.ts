@@ -23,6 +23,75 @@ type DownloadVideosOptions = {
     force?: boolean;
 };
 
+const DELAY_BETWEEN_DOWNLOAD_ATTEMPTS_MS = 20_000;
+const PAUSE_AFTER_ATTEMPTS_COUNT = 20;
+const PAUSE_AFTER_ATTEMPTS_MS = 5 * 60_000;
+
+const ESTIMATED_DOWNLOAD_TIME_PER_VIDEO_MS = 30_000;
+
+async function sleep(milliseconds: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+        setTimeout(resolve, milliseconds);
+    });
+}
+
+function formatDuration(milliseconds: number): string {
+    const totalSeconds = Math.ceil(milliseconds / 1000);
+
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    const parts: string[] = [];
+
+    if (hours > 0) {
+        parts.push(`${hours} hour${hours === 1 ? "" : "s"}`);
+    }
+
+    if (minutes > 0) {
+        parts.push(`${minutes} minute${minutes === 1 ? "" : "s"}`);
+    }
+
+    if (seconds > 0 && hours === 0) {
+        parts.push(`${seconds} second${seconds === 1 ? "" : "s"}`);
+    }
+
+    if (parts.length === 0) {
+        return "0 seconds";
+    }
+
+    return parts.join(" ");
+}
+
+function calculateEstimatedTotalTime(
+    totalVideos: number,
+): {
+    totalMilliseconds: number;
+    estimatedDownloadMilliseconds: number;
+    delayMilliseconds: number;
+    normalDelayCount: number;
+    longPauseCount: number;
+} {
+    const delaysAfterAttempts = Math.max(totalVideos - 1, 0);
+    const longPauseCount = Math.floor(delaysAfterAttempts / PAUSE_AFTER_ATTEMPTS_COUNT);
+    const normalDelayCount = delaysAfterAttempts - longPauseCount;
+
+    const estimatedDownloadMilliseconds =
+        totalVideos * ESTIMATED_DOWNLOAD_TIME_PER_VIDEO_MS;
+
+    const delayMilliseconds =
+        normalDelayCount * DELAY_BETWEEN_DOWNLOAD_ATTEMPTS_MS +
+        longPauseCount * PAUSE_AFTER_ATTEMPTS_MS;
+
+    return {
+        totalMilliseconds: estimatedDownloadMilliseconds + delayMilliseconds,
+        estimatedDownloadMilliseconds,
+        delayMilliseconds,
+        normalDelayCount,
+        longPauseCount,
+    };
+}
+
 async function getFfmpegToolsDirectory(): Promise<string> {
     const toolsDir = path.dirname(
         getBundledBinaryPath("ffmpeg.exe"),
@@ -77,6 +146,35 @@ async function askYesNo(question: string): Promise<boolean> {
     } finally {
         readline.close();
     }
+}
+
+async function confirmSlowDownloadMode(totalVideos: number): Promise<boolean> {
+    const estimate = calculateEstimatedTotalTime(totalVideos);
+
+    console.log("");
+    console.log("YouTube may slow down, interrupt, or block automated download requests if too many videos are requested too quickly.");
+    console.log(
+        `To reduce bot-detection problems, this downloader waits ${formatDuration(DELAY_BETWEEN_DOWNLOAD_ATTEMPTS_MS)} between each video attempt and pauses for ${formatDuration(PAUSE_AFTER_ATTEMPTS_MS)} after every ${PAUSE_AFTER_ATTEMPTS_COUNT} attempts.`,
+    );
+    console.log(
+        `This makes large batches slower, but it gives the downloads a better chance of completing successfully. This run will attempt ${totalVideos} video${totalVideos === 1 ? "" : "s"} before retry prompts.`,
+    );
+    console.log("");
+    console.log("Estimated time for this pass:");
+    console.log(
+        `- Estimated actual download time: ${formatDuration(estimate.estimatedDownloadMilliseconds)} based on about ${formatDuration(ESTIMATED_DOWNLOAD_TIME_PER_VIDEO_MS)} per video.`,
+    );
+    console.log(
+        `- Added pacing delay: ${formatDuration(estimate.delayMilliseconds)} from ${estimate.normalDelayCount} short delay${estimate.normalDelayCount === 1 ? "" : "s"} and ${estimate.longPauseCount} long pause${estimate.longPauseCount === 1 ? "" : "s"}.`,
+    );
+    console.log(
+        `- Estimated total time: ${formatDuration(estimate.totalMilliseconds)}.`,
+    );
+    console.log("");
+    console.log("This is only an estimate. The real time may be longer or shorter depending on video length, internet speed, and YouTube response time.");
+    console.log("");
+
+    return askYesNo("Continue with slowed-down downloading?");
 }
 
 function formatCsvField(value: string): string {
@@ -169,11 +267,11 @@ function formatDownloadError(error: unknown): string {
         const details: string[] = [];
 
         if (possibleExecError.stderr?.trim()) {
-            details.push(possibleExecError.stderr.trim());
+            details.push(possibleExecError.stderr?.trim());
         }
 
         if (possibleExecError.stdout?.trim()) {
-            details.push(possibleExecError.stdout.trim());
+            details.push(possibleExecError.stdout?.trim());
         }
 
         if (possibleExecError.message.trim()) {
@@ -213,6 +311,35 @@ function printFailureSummary(
     console.error(`Full failure details saved to ${failureErrorPath}.`);
 }
 
+async function waitBeforeNextAttempt(
+    attemptedInThisPass: number,
+    totalInThisPass: number,
+    updateStatus: (status: string) => void,
+): Promise<void> {
+    if (attemptedInThisPass >= totalInThisPass) {
+        return;
+    }
+
+    if (attemptedInThisPass % PAUSE_AFTER_ATTEMPTS_COUNT === 0) {
+        updateStatus(
+            `Pausing ${formatDuration(PAUSE_AFTER_ATTEMPTS_MS)} after ${attemptedInThisPass} attempts...`,
+        );
+
+        await sleep(PAUSE_AFTER_ATTEMPTS_MS);
+
+        updateStatus("Continuing downloads...");
+        return;
+    }
+
+    updateStatus(
+        `Waiting ${formatDuration(DELAY_BETWEEN_DOWNLOAD_ATTEMPTS_MS)} before next attempt...`,
+    );
+
+    await sleep(DELAY_BETWEEN_DOWNLOAD_ATTEMPTS_MS);
+
+    updateStatus("Continuing downloads...");
+}
+
 export async function downloadVideos(
     csvPath: string,
     options: DownloadVideosOptions = {},
@@ -224,6 +351,18 @@ export async function downloadVideos(
         skip_empty_lines: true,
         trim: true,
     }) as VideoRow[];
+
+    if (records.length === 0) {
+        console.log("No videos found in the CSV.");
+        return;
+    }
+
+    const shouldContinue = await confirmSlowDownloadMode(records.length);
+
+    if (!shouldContinue) {
+        console.log("Download cancelled.");
+        return;
+    }
 
     await fs.ensureDir("downloads/audio");
 
@@ -259,30 +398,54 @@ export async function downloadVideos(
 
         const failedDownloads: FailedDownload[] = [];
 
+        console.log("");
+        console.log(
+            `${passName}: ${videos.length} video${videos.length === 1 ? "" : "s"} will be attempted.`,
+        );
+        console.log(
+            `Pacing: ${formatDuration(DELAY_BETWEEN_DOWNLOAD_ATTEMPTS_MS)} between attempts, plus ${formatDuration(PAUSE_AFTER_ATTEMPTS_MS)} after every ${PAUSE_AFTER_ATTEMPTS_COUNT} attempts.`,
+        );
+        console.log("");
+
         const progressBar = new cliProgress.SingleBar(
             {
-                format: `${passName} |{bar}| {value}/{total} {spinner}`,
+                format: `${passName} |{bar}| {value}/{total} {spinner} {status}`,
                 clearOnComplete: true,
                 hideCursor: true,
             },
             cliProgress.Presets.shades_classic,
         );
 
+        let progressStatus = "Starting...";
+
         progressBar.start(videos.length, 0, {
             spinner: spinnerFrames[spinnerIndex],
+            status: progressStatus,
         });
+
+        const updateProgressBar = (status: string): void => {
+            progressStatus = status;
+
+            progressBar.update(processedCount, {
+                spinner: spinnerFrames[spinnerIndex],
+                status: progressStatus,
+            });
+        };
 
         const spinnerInterval = setInterval(() => {
             spinnerIndex = (spinnerIndex + 1) % spinnerFrames.length;
 
             progressBar.update(processedCount, {
                 spinner: spinnerFrames[spinnerIndex],
+                status: progressStatus,
             });
         }, 100);
 
         try {
             for (const video of videos) {
                 const outputPath = `downloads/audio/${video.id}.%(ext)s`;
+
+                updateProgressBar(`Downloading ${video.id}...`);
 
                 try {
                     await ytDlp(video.url, {
@@ -299,9 +462,7 @@ export async function downloadVideos(
                     successfulCount += 1;
                     processedCount += 1;
 
-                    progressBar.update(processedCount, {
-                        spinner: spinnerFrames[spinnerIndex],
-                    });
+                    updateProgressBar(`Finished ${video.id}.`);
                 } catch (error) {
                     failedDownloads.push({
                         video,
@@ -311,10 +472,14 @@ export async function downloadVideos(
                     failedCount += 1;
                     processedCount += 1;
 
-                    progressBar.update(processedCount, {
-                        spinner: spinnerFrames[spinnerIndex],
-                    });
+                    updateProgressBar(`Failed ${video.id}.`);
                 }
+
+                await waitBeforeNextAttempt(
+                    processedCount,
+                    videos.length,
+                    updateProgressBar,
+                );
             }
         } finally {
             clearInterval(spinnerInterval);
@@ -370,7 +535,7 @@ export async function downloadVideos(
             }
         } else {
             console.log(
-                `Force retry enabled. Retrying ${remainingFailures.length} failed download(s)...`,
+                `Force retry enabled. Retrying ${remainingFailures.length} failed download(s) after the same slow pacing rules...`,
             );
         }
 
