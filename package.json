@@ -1,6 +1,6 @@
 {
   "name": "youtube-to-soferai",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Converts YouTube shiurim into readable documents.",
   "main": "index.js",
   "scripts": {
