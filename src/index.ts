@@ -50,16 +50,23 @@ program
 
 type DownloadCommandOptions = {
     force?: boolean;
+    forceSafe?: boolean;
 };
 
 program
     .command("download")
     .argument("<csvPath>", "Path to the videos CSV")
     .option("--force", "Keep retrying failed downloads without asking")
+    .option("--force-safe", "Safely retry failed downloads after long waits, stopping after repeated bot-detection failures")
     .description("Download YouTube videos as audio files")
     .action(async (csvPath: string, options: DownloadCommandOptions) => {
+        if (options.force && options.forceSafe) {
+            throw new Error("Use either --force or --force-safe, not both.");
+        }
+
         await downloadVideos(csvPath, {
             force: options.force,
+            forceSafe: options.forceSafe,
         });
     });
 

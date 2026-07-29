@@ -21,6 +21,7 @@ type FailedDownload = {
 
 type DownloadVideosOptions = {
     force?: boolean;
+    forceSafe?: boolean;
 };
 
 const DELAY_BETWEEN_DOWNLOAD_ATTEMPTS_MS = 20_000;
@@ -29,10 +30,57 @@ const PAUSE_AFTER_ATTEMPTS_MS = 5 * 60_000;
 
 const ESTIMATED_DOWNLOAD_TIME_PER_VIDEO_MS = 30_000;
 
+const FORCE_SAFE_RETRY_DELAY_MS = 90 * 60_000;
+const FORCE_SAFE_MAX_BOT_DETECTION_RETRIES = 3;
+
+const BOT_DETECTION_WARNING_STREAK_COUNT = 5;
+
 async function sleep(milliseconds: number): Promise<void> {
     await new Promise<void>((resolve) => {
         setTimeout(resolve, milliseconds);
     });
+}
+
+async function sleepWithCountdown(
+    milliseconds: number,
+    getStatus: (remainingMilliseconds: number) => string,
+    updateStatus: (status: string) => void,
+): Promise<void> {
+    const endTime = Date.now() + milliseconds;
+
+    while (true) {
+        const remainingMilliseconds = Math.max(endTime - Date.now(), 0);
+
+        updateStatus(getStatus(remainingMilliseconds));
+
+        if (remainingMilliseconds <= 0) {
+            break;
+        }
+
+        await sleep(Math.min(1000, remainingMilliseconds));
+    }
+}
+
+async function sleepWithSingleLineCountdown(
+    milliseconds: number,
+    getMessage: (remainingMilliseconds: number) => string,
+): Promise<void> {
+    const endTime = Date.now() + milliseconds;
+
+    while (true) {
+        const remainingMilliseconds = Math.max(endTime - Date.now(), 0);
+        const message = getMessage(remainingMilliseconds);
+
+        process.stdout.write(`\r${message}`);
+
+        if (remainingMilliseconds <= 0) {
+            break;
+        }
+
+        await sleep(Math.min(1000, remainingMilliseconds));
+    }
+
+    process.stdout.write("\n");
 }
 
 function formatDuration(milliseconds: number): string {
@@ -254,6 +302,20 @@ async function saveFailedDownloadErrors(
     );
 }
 
+function printBotDetectionStreakWarning(
+    botDetectionFailureStreak: number,
+): void {
+    console.log("");
+    console.log("A bot error has been detected.");
+    console.log(
+        `There have been ${botDetectionFailureStreak} bot-detection error(s) in a row with no successful downloads.`,
+    );
+    console.log(
+        "It is recommended that you cancel this download with Ctrl+C and retry it in a few hours from now.",
+    );
+    console.log("");
+}
+
 function formatDownloadError(error: unknown): string {
     if (error instanceof Error) {
         const possibleExecError = error as Error & {
@@ -296,6 +358,27 @@ function formatDownloadError(error: unknown): string {
     return String(error);
 }
 
+function isBotDetectionError(errorText: string): boolean {
+    const normalizedErrorText = errorText.toLowerCase();
+
+    return (
+        normalizedErrorText.includes("sign in to confirm you're not a bot") ||
+        normalizedErrorText.includes("sign in to confirm you’re not a bot") ||
+        normalizedErrorText.includes("confirm you're not a bot") ||
+        normalizedErrorText.includes("confirm you’re not a bot") ||
+        normalizedErrorText.includes("not a bot") ||
+        normalizedErrorText.includes("captcha")
+    );
+}
+
+function hasBotDetectionFailures(
+    failedDownloads: FailedDownload[],
+): boolean {
+    return failedDownloads.some((failedDownload) =>
+        isBotDetectionError(failedDownload.error),
+    );
+}
+
 function printFailureSummary(
     failedDownloads: FailedDownload[],
     failureCsvPath: string,
@@ -321,21 +404,23 @@ async function waitBeforeNextAttempt(
     }
 
     if (attemptedInThisPass % PAUSE_AFTER_ATTEMPTS_COUNT === 0) {
-        updateStatus(
-            `Pausing ${formatDuration(PAUSE_AFTER_ATTEMPTS_MS)} after ${attemptedInThisPass} attempts...`,
+        await sleepWithCountdown(
+            PAUSE_AFTER_ATTEMPTS_MS,
+            (remainingMilliseconds) =>
+                `Long pause after ${attemptedInThisPass} attempts. Next download in ${formatDuration(remainingMilliseconds)}...`,
+            updateStatus,
         );
-
-        await sleep(PAUSE_AFTER_ATTEMPTS_MS);
 
         updateStatus("Continuing downloads...");
         return;
     }
 
-    updateStatus(
-        `Waiting ${formatDuration(DELAY_BETWEEN_DOWNLOAD_ATTEMPTS_MS)} before next attempt...`,
+    await sleepWithCountdown(
+        DELAY_BETWEEN_DOWNLOAD_ATTEMPTS_MS,
+        (remainingMilliseconds) =>
+            `Next download in ${formatDuration(remainingMilliseconds)}...`,
+        updateStatus,
     );
-
-    await sleep(DELAY_BETWEEN_DOWNLOAD_ATTEMPTS_MS);
 
     updateStatus("Continuing downloads...");
 }
@@ -395,6 +480,8 @@ export async function downloadVideos(
         let processedCount = 0;
         let successfulCount = 0;
         let failedCount = 0;
+        let botDetectionFailureStreak = 0;
+        let botDetectionStreakWarningPrinted = false;
 
         const failedDownloads: FailedDownload[] = [];
 
@@ -460,19 +547,58 @@ export async function downloadVideos(
                     });
 
                     successfulCount += 1;
+
+                    botDetectionFailureStreak = 0;
+                    botDetectionStreakWarningPrinted = false;
+
                     processedCount += 1;
 
                     updateProgressBar(`Finished ${video.id}.`);
                 } catch (error) {
+                    const formattedError = formatDownloadError(error);
+
                     failedDownloads.push({
                         video,
-                        error: formatDownloadError(error),
+                        error: formattedError,
                     });
+
+                    await saveFailedVideos(
+                        failedDownloads,
+                        failureCsvPath,
+                    );
+
+                    await saveFailedDownloadErrors(
+                        failedDownloads,
+                        failureErrorPath,
+                    );
 
                     failedCount += 1;
                     processedCount += 1;
 
+                    if (isBotDetectionError(formattedError)) {
+                        botDetectionFailureStreak += 1;
+                    } else {
+                        botDetectionFailureStreak = 0;
+                        botDetectionStreakWarningPrinted = false;
+                    }
+
                     updateProgressBar(`Failed ${video.id}.`);
+
+                    if (
+                        botDetectionFailureStreak >= BOT_DETECTION_WARNING_STREAK_COUNT &&
+                        !botDetectionStreakWarningPrinted
+                    ) {
+                        progressBar.stop();
+
+                        printBotDetectionStreakWarning(botDetectionFailureStreak);
+
+                        progressBar.start(videos.length, processedCount, {
+                            spinner: spinnerFrames[spinnerIndex],
+                            status: progressStatus,
+                        });
+
+                        botDetectionStreakWarningPrinted = true;
+                    }
                 }
 
                 await waitBeforeNextAttempt(
@@ -515,9 +641,50 @@ export async function downloadVideos(
     );
 
     let retryNumber = 1;
+    let forceSafeBotDetectionRetryCount = 0;
 
     while (remainingFailures.length > 0) {
-        if (!options.force) {
+        const botDetectionFailuresPresent = hasBotDetectionFailures(remainingFailures);
+
+        if (options.forceSafe) {
+            if (botDetectionFailuresPresent) {
+                forceSafeBotDetectionRetryCount += 1;
+
+                if (forceSafeBotDetectionRetryCount > FORCE_SAFE_MAX_BOT_DETECTION_RETRIES) {
+                    console.log("");
+                    console.log(
+                        `Force-safe mode stopped because YouTube bot-detection failures are still happening after ${FORCE_SAFE_MAX_BOT_DETECTION_RETRIES} safe retry round(s).`,
+                    );
+                    console.log(
+                        `Remaining failed videos were saved to ${failureCsvPath}.`,
+                    );
+                    console.log(
+                        `Failure details were saved to ${failureErrorPath}.`,
+                    );
+                    console.log("");
+                    console.log("Try again later, use a different network, or retry with browser cookies if appropriate.");
+                    return;
+                }
+
+                console.log("");
+                console.log(
+                    `YouTube bot-detection failures were found. Force-safe retry ${forceSafeBotDetectionRetryCount}/${FORCE_SAFE_MAX_BOT_DETECTION_RETRIES} will wait ${formatDuration(FORCE_SAFE_RETRY_DELAY_MS)} before retrying.`,
+                );
+            } else {
+                console.log("");
+                console.log(
+                    `Force-safe mode enabled. Waiting ${formatDuration(FORCE_SAFE_RETRY_DELAY_MS)} before retrying ${remainingFailures.length} failed download(s).`,
+                );
+            }
+
+            console.log("You can stop this wait with Ctrl+C.");
+
+            await sleepWithSingleLineCountdown(
+                FORCE_SAFE_RETRY_DELAY_MS,
+                (remainingMilliseconds) =>
+                    `Force-safe retry starts in ${formatDuration(remainingMilliseconds)}...`,
+            );
+        } else if (!options.force) {
             const shouldRetry = await askYesNo(
                 `Retry ${remainingFailures.length} failed download(s)?`,
             );
