@@ -37,6 +37,12 @@ type TranscriptionInfo = {
 
 type TranscriptionStatusResponse = TranscriptionInfo;
 
+type TranscriptionStatusSummary = {
+    id: string;
+    title: string;
+    status: TranscriptionStatus;
+};
+
 type TranscriptionResponse = {
     text: string;
     info: TranscriptionInfo;
@@ -60,7 +66,7 @@ type SubmissionSuccess = {
         audioPath: string;
         audioSizeBytes: number;
     };
-    latestStatus?: TranscriptionStatusResponse;
+    latestStatus?: TranscriptionStatusResponse | TranscriptionStatusSummary;
     lastStatusCheckedAt?: string;
 };
 
@@ -215,6 +221,234 @@ async function getTranscription(
     return response.data as TranscriptionResponse;
 }
 
+async function getAllTranscriptionStatuses(
+    apiKey: string,
+): Promise<Map<string, TranscriptionStatusSummary>> {
+    const response = await axios.get<unknown>(
+        "https://api.sofer.ai/v1/transcriptions/",
+        {
+            headers: {
+                Authorization: `Bearer ${apiKey}`,
+                "Content-Type": "application/json",
+            },
+            timeout: 300_000,
+        },
+    );
+
+    if (!Array.isArray(response.data)) {
+        throw new Error(
+            `Unexpected Sofer list response: ${JSON.stringify(response.data)}`,
+        );
+    }
+
+    const statuses = new Map<string, TranscriptionStatusSummary>();
+
+    for (const item of response.data) {
+        if (!item || typeof item !== "object") {
+            continue;
+        }
+
+        const record = item as Record<string, unknown>;
+
+        if (
+            typeof record.id !== "string" ||
+            typeof record.title !== "string" ||
+            typeof record.status !== "string"
+        ) {
+            continue;
+        }
+
+        statuses.set(record.id, {
+            id: record.id,
+            title: record.title,
+            status: record.status as TranscriptionStatus,
+        });
+    }
+
+    return statuses;
+}
+
+
+const SENTENCE_ABBREVIATIONS = new Set([
+    "Dr.",
+    "Mrs.",
+    "Mr.",
+    "a.m.",
+    "p.m.",
+    "e.g.",
+    "i.e.",
+    "B.A.",
+    "M.A.",
+    "Ph.D.",
+    "M.D.",
+    "etc.",
+    "vs.",
+    "et al.",
+    "cf.",
+    "q.v.",
+    "J.K.",
+    "W.E.B.",
+    "Prof.",
+    "Rev.",
+    "Lt.",
+    "Capt.",
+    "Inc.",
+    "Ltd.",
+    "Co.",
+    "Gen.",
+    "Col.",
+    "Maj.",
+    "mm.",
+    "cm.",
+    "kg.",
+    "Fr.",
+    "Sr.",
+    "Br.",
+    "U.S.",
+    "U.K.",
+    "P.S.",
+    "M.",
+    "Mme.",
+    "Mlle.",
+    "St.",
+    "Ste.",
+]);
+
+function formatDuration(durationSeconds: number | null): string {
+    if (durationSeconds === null) {
+        return "Unknown";
+    }
+
+    const totalSeconds = Math.max(0, Math.round(durationSeconds));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+
+    const parts: string[] = [];
+
+    if (hours > 0) {
+        parts.push(`${hours} ${hours === 1 ? "hour" : "hours"}`);
+    }
+
+    if (minutes > 0) {
+        parts.push(`${minutes} ${minutes === 1 ? "minute" : "minutes"}`);
+    }
+
+    if (seconds > 0 || parts.length === 0) {
+        parts.push(`${seconds} ${seconds === 1 ? "second" : "seconds"}`);
+    }
+
+    return parts.join(" ");
+}
+
+function containsHebrew(text: string): boolean {
+    return /[\u0590-\u05FF]/.test(text);
+}
+
+function removeHtmlTags(text: string): string {
+    return text.replace(/<[^>]+>/g, "");
+}
+
+function cleanSoferTranscriptText(transcriptionText: string): string {
+    return decode(transcriptionText)
+        // Sofer's API puts romanized Hebrew inside <i>...</i>. The website copy the user
+        // showed does not include those romanizations, so remove those italic blocks.
+        .replace(/\s*<i>.*?<\/i>/gis, "")
+        .replace(/&nbsp;/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function isPeriodSentenceEnd(words: string[], index: number): boolean {
+    const word = removeHtmlTags(words[index] ?? "");
+
+    if (!word.endsWith(".") || SENTENCE_ABBREVIATIONS.has(word)) {
+        return false;
+    }
+
+    const twoWordPhrase = index > 0 ? `${words[index - 1]} ${word}` : word;
+
+    return !SENTENCE_ABBREVIATIONS.has(removeHtmlTags(twoWordPhrase));
+}
+
+function isAnySentenceEnd(words: string[], index: number): boolean {
+    const word = removeHtmlTags(words[index] ?? "");
+
+    if (!/[.!?]$/.test(word) || SENTENCE_ABBREVIATIONS.has(word)) {
+        return false;
+    }
+
+    const twoWordPhrase = index > 0 ? `${words[index - 1]} ${word}` : word;
+
+    return !SENTENCE_ABBREVIATIONS.has(removeHtmlTags(twoWordPhrase));
+}
+
+function createTranscriptParagraphTexts(
+    transcription: TranscriptionResponse,
+): string[] {
+    const cleanedText = cleanSoferTranscriptText(transcription.text);
+
+    if (!cleanedText) {
+        return [];
+    }
+
+    const words = cleanedText.split(/\s+/);
+    const paragraphs: string[] = [];
+    let currentWords: string[] = [];
+    let completedPeriodSentences = 0;
+    let previousWordWasSentenceEnd = false;
+    const primaryLanguage = transcription.info.primary_language;
+    const isPrimaryLanguageHebrew = primaryLanguage === "he" || primaryLanguage === "yi";
+
+    const finishParagraph = (): void => {
+        const paragraphText = currentWords.join(" ").replace(/\s+/g, " ").trim();
+
+        if (paragraphText) {
+            paragraphs.push(paragraphText);
+        }
+
+        currentWords = [];
+    };
+
+    for (let index = 0; index < words.length; index += 1) {
+        const word = words[index];
+
+        // This mirrors the Sofer app behavior visible in the JS bundle: in a primarily
+        // English transcript, if a completed sentence is followed by Hebrew text, start
+        // a fresh paragraph before that Hebrew text.
+        if (
+            !isPrimaryLanguageHebrew &&
+            previousWordWasSentenceEnd &&
+            containsHebrew(removeHtmlTags(word)) &&
+            currentWords.length > 0
+        ) {
+            /*
+             * Match Sofer's frontend: this Hebrew-transition break starts a new
+             * paragraph, but it does NOT reset the running sentence counter.
+             * Resetting here caused later breaks to drift from the Sofer site.
+             */
+            finishParagraph();
+        }
+
+        currentWords.push(word);
+
+        if (isPeriodSentenceEnd(words, index)) {
+            completedPeriodSentences += 1;
+
+            if (completedPeriodSentences === 4) {
+                finishParagraph();
+                completedPeriodSentences = 0;
+            }
+        }
+
+        previousWordWasSentenceEnd = isAnySentenceEnd(words, index);
+    }
+
+    finishParagraph();
+
+    return paragraphs;
+}
+
 function createFormattedRuns(text: string): TextRun[] {
     const decodedText = decode(text);
 
@@ -267,21 +501,17 @@ function createFormattedRuns(text: string): TextRun[] {
 }
 
 function createTranscriptParagraphs(
-    transcriptionText: string,
+    transcription: TranscriptionResponse,
 ): Paragraph[] {
-    return transcriptionText
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0)
-        .map(
-            (line) =>
-                new Paragraph({
-                    children: createFormattedRuns(line),
-                    spacing: {
-                        after: 160,
-                    },
-                }),
-        );
+    return createTranscriptParagraphTexts(transcription).map(
+        (paragraphText) =>
+            new Paragraph({
+                children: createFormattedRuns(paragraphText),
+                spacing: {
+                    after: 160,
+                },
+            }),
+    );
 }
 
 async function createTranscriptDocx(
@@ -289,9 +519,7 @@ async function createTranscriptDocx(
     submission: SubmissionSuccess,
     transcription: TranscriptionResponse,
 ): Promise<void> {
-    const paragraphs = createTranscriptParagraphs(
-        transcription.text,
-    );
+    const paragraphs = createTranscriptParagraphs(transcription);
 
     const document = new Document({
         sections: [
@@ -325,13 +553,23 @@ async function createTranscriptDocx(
                     new Paragraph({
                         children: [
                             new TextRun({
+                                text: "Sofer transcription ID: ",
+                                bold: true,
+                            }),
+                            new TextRun(
+                                submission.transcriptionId,
+                            ),
+                        ],
+                    }),
+
+                    new Paragraph({
+                        children: [
+                            new TextRun({
                                 text: "Duration: ",
                                 bold: true,
                             }),
                             new TextRun(
-                                transcription.info.duration !== null
-                                    ? `${transcription.info.duration} seconds`
-                                    : "Unknown",
+                                formatDuration(transcription.info.duration),
                             ),
                         ],
                     }),
@@ -370,27 +608,16 @@ function createMarkdownContents(
         `# ${submission.source.title}\n\n` +
         `- Source ID: ${submission.source.id}\n` +
         `- Source URL: ${submission.source.url}\n` +
-        `- Duration: ${
-            transcription.info.duration !== null
-                ? `${transcription.info.duration} seconds`
-                : "Unknown"
-        }\n` +
+        `- Sofer transcription ID: ${submission.transcriptionId}\n` +
+        `- Duration: ${formatDuration(transcription.info.duration)}\n` +
         `- Model: ${transcription.info.model}\n\n` +
         `---\n\n` +
-        `${transcription.text.trim()}\n`
+        `${createTranscriptParagraphTexts(transcription).join("\n\n")}\n`
     );
 }
 
 export async function checkTranscriptions(): Promise<void> {
     const apiKey = process.env.SOFER_API_KEY;
-
-    console.log(
-        `Using SOFER_API_KEY: ${
-            apiKey
-                ? `${apiKey.slice(0, 4)}...${apiKey.slice(-4)}`
-                : "missing"
-        }`,
-    );
 
     if (!apiKey) {
         throw new Error(
@@ -424,16 +651,9 @@ export async function checkTranscriptions(): Promise<void> {
         return;
     }
 
-    let checkedCount = 0;
-    let failedChecks = 0;
     let lastRequestStartedAt = 0;
 
-    const statusCounts = new Map<string, number>();
-    const completedSubmissions: CompletedSubmission[] = [];
-
-    console.log(
-        `Checking ${submissionFiles.length} saved transcription(s)...`,
-    );
+    const savedSubmissions: CompletedSubmission[] = [];
 
     for (let index = 0; index < submissionFiles.length; index += 1) {
         const fileName = submissionFiles[index];
@@ -451,74 +671,80 @@ export async function checkTranscriptions(): Promise<void> {
             continue;
         }
 
-        const submission = savedData;
+        savedSubmissions.push({
+            submission: savedData,
+            submissionPath,
+        });
+    }
 
-        try {
-            await waitForRateLimit(lastRequestStartedAt);
+    console.log(
+        `Checking ${savedSubmissions.length} saved transcription(s) with one Sofer list request...`,
+    );
 
-            lastRequestStartedAt = Date.now();
+    lastRequestStartedAt = Date.now();
 
-            const response = await axios.get<unknown>(
-                `https://api.sofer.ai/v1/transcriptions/${submission.transcriptionId}/status`,
-                {
-                    headers: {
-                        Authorization: `Bearer ${apiKey}`,
-                    },
-                    timeout: 300_000,
-                },
-            );
+    const accountStatuses = await getAllTranscriptionStatuses(apiKey);
+    const checkedAt = new Date().toISOString();
+    const statusCounts = new Map<string, number>();
+    const completedSubmissions: CompletedSubmission[] = [];
+    let checkedCount = 0;
+    let missingFromAccountCount = 0;
 
-            const transcriptionStatus =
-                response.data as TranscriptionStatusResponse;
+    for (let index = 0; index < savedSubmissions.length; index += 1) {
+        const { submission, submissionPath } = savedSubmissions[index];
+        const transcriptionStatus = accountStatuses.get(submission.transcriptionId);
 
-            const updatedSubmission: SubmissionSuccess = {
-                ...submission,
-                latestStatus: transcriptionStatus,
-                lastStatusCheckedAt: new Date().toISOString(),
-            };
-
-            await fs.writeJson(
-                submissionPath,
-                updatedSubmission,
-                {
-                    spaces: 2,
-                },
-            );
-
-            if (transcriptionStatus.status === "COMPLETED") {
-                completedSubmissions.push({
-                    submission: updatedSubmission,
-                    submissionPath,
-                });
-            }
-
-            checkedCount += 1;
-
-            statusCounts.set(
-                transcriptionStatus.status,
-                (statusCounts.get(transcriptionStatus.status) ?? 0) + 1,
-            );
+        if (!transcriptionStatus) {
+            missingFromAccountCount += 1;
 
             console.log(
-                `[${index + 1}/${submissionFiles.length}] ` +
+                `[${index + 1}/${savedSubmissions.length}] ` +
                 `${submission.source.id}: ${submission.source.title} — ` +
-                `${transcriptionStatus.status}`,
+                `not found in Sofer account list`,
             );
-        } catch (error) {
-            failedChecks += 1;
 
-            console.error(
-                `[${index + 1}/${submissionFiles.length}] ` +
-                `${submission.source.id}: ${submission.source.title} — ` +
-                `status check failed: ${getErrorMessage(error)}`,
-            );
+            continue;
         }
+
+        const updatedSubmission: SubmissionSuccess = {
+            ...submission,
+            latestStatus: transcriptionStatus,
+            lastStatusCheckedAt: checkedAt,
+        };
+
+        await fs.writeJson(
+            submissionPath,
+            updatedSubmission,
+            {
+                spaces: 2,
+            },
+        );
+
+        if (transcriptionStatus.status === "COMPLETED") {
+            completedSubmissions.push({
+                submission: updatedSubmission,
+                submissionPath,
+            });
+        }
+
+        checkedCount += 1;
+
+        statusCounts.set(
+            transcriptionStatus.status,
+            (statusCounts.get(transcriptionStatus.status) ?? 0) + 1,
+        );
+
+        console.log(
+            `[${index + 1}/${savedSubmissions.length}] ` +
+            `${submission.source.id}: ${submission.source.title} — ` +
+            `${transcriptionStatus.status}`,
+        );
     }
 
     console.log("");
     console.log("Status check complete.");
-    console.log(`Checked successfully: ${checkedCount}`);
-    console.log(`Status checks that failed: ${failedChecks}`);
+    console.log(`Checked from account list: ${checkedCount}`);
+    console.log(`Missing from account list: ${missingFromAccountCount}`);
 
     for (const [status, count] of statusCounts) {
         console.log(`${status}: ${count}`);

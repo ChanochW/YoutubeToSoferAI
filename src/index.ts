@@ -12,7 +12,7 @@ const program = new Command();
 program
     .name("youtube-to-soferai")
     .description("Converts YouTube shiurim into readable documents.")
-    .version("1.0.1");
+    .version("1.1.0");
 
 type InitCommandOptions = {
     force?: boolean;
