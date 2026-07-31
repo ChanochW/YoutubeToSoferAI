@@ -2,17 +2,17 @@ import { Command } from "commander";
 import { downloadVideos } from "./commands/downloadVideos";
 import { transcribeLocal } from "./commands/transcribeLocal";
 import { submitStandardBatch } from "./commands/submitStandardBatch";
-import {checkTranscriptions} from "./commands/checkTranscriptions";
-import {channelToCsv} from "./commands/channelToCsv";
+import { checkTranscriptions } from "./commands/checkTranscriptions";
+import { channelToCsv } from "./commands/channelToCsv";
 import "dotenv/config";
-import {initProject} from "./commands/init";
+import { initProject } from "./commands/init";
 
 const program = new Command();
 
 program
     .name("youtube-to-soferai")
     .description("Converts YouTube shiurim into readable documents.")
-    .version("1.1.0");
+    .version("1.1.1");
 
 type InitCommandOptions = {
     force?: boolean;
@@ -23,11 +23,9 @@ program
     .argument("<apiKey>", "Your Sofer.ai API key")
     .option(
         "--force",
-        "Replace the existing SOFER_API_KEY in .env if one already exists",
+        "Overwrite an existing SOFER_API_KEY in .env instead of leaving it unchanged",
     )
-    .description(
-        "Create or update the .env file with your Sofer.ai API key",
-    )
+    .description("Create or update the local .env file with your Sofer.ai API key")
     .action(async (
         apiKey: string,
         options: InitCommandOptions,
@@ -39,12 +37,15 @@ program
 
 program
     .command("channel-to-csv")
-    .argument("<channelUrl>", "YouTube channel URL")
-    .argument("<outputCsvPath>", "Where to save the generated CSV")
-    .description(
-        "Create a CSV of video titles and links from a YouTube channel (oldest to newest)",
+    .argument("<channelUrl>", "YouTube channel or channel /videos URL to scan")
+    .argument(
+        "<outputCsvPath>",
+        "Path where the generated CSV should be saved, for example data/videos.csv",
     )
-    .action(async (channelUrl, outputCsvPath) => {
+    .description(
+        "Create a fresh CSV of video titles and links from a YouTube channel, ordered oldest to newest. This overwrites the target CSV.",
+    )
+    .action(async (channelUrl: string, outputCsvPath: string) => {
         await channelToCsv(channelUrl, outputCsvPath);
     });
 
@@ -55,10 +56,21 @@ type DownloadCommandOptions = {
 
 program
     .command("download")
-    .argument("<csvPath>", "Path to the videos CSV")
-    .option("--force", "Keep retrying failed downloads without asking")
-    .option("--force-safe", "Safely retry failed downloads after long waits, stopping after repeated bot-detection failures")
-    .description("Download YouTube videos as audio files")
+    .argument(
+        "<csvPath>",
+        "Path to the videos CSV, for example data/videos.csv",
+    )
+    .option(
+        "--force",
+        "Retry failed downloads automatically without asking. More aggressive; may keep retrying bot-detection failures.",
+    )
+    .option(
+        "--force-safe",
+        "Retry failed downloads with longer waits and stop after repeated bot-detection failures.",
+    )
+    .description(
+        "Download each CSV video as an MP3 into downloads/audio, skipping audio files that already exist unless a retry option is used.",
+    )
     .action(async (csvPath: string, options: DownloadCommandOptions) => {
         if (options.force && options.forceSafe) {
             throw new Error("Use either --force or --force-safe, not both.");
@@ -77,17 +89,20 @@ type TranscribeLocalCommandOptions = {
 
 program
     .command("transcribe-local")
-    .argument("<csvPath>", "Path to the videos CSV")
+    .argument(
+        "<csvPath>",
+        "Path to the videos CSV, for example data/videos.csv",
+    )
     .option(
         "--retry-unknown",
-        "Retry clips whose earlier upload outcome was unknown",
+        "Include clips whose previous upload may have reached Sofer but did not return a clear result. Use only after checking the prior outcome.",
     )
     .option(
         "--unchecked",
-        "Skip duration/cost checking and upload eligible MP3s directly",
+        "Skip duration and cost checking, then upload eligible MP3s directly to Sofer.",
     )
     .description(
-        "Upload downloaded MP3 files to Sofer one at a time",
+        "Upload downloaded MP3 files from downloads/audio to Sofer one at a time. Saves submission records in data/sofer/submissions.",
     )
     .action(async (
         csvPath: string,
@@ -102,7 +117,7 @@ program
 program
     .command("check-transcriptions")
     .description(
-        "Check the status of every locally saved Sofer transcription",
+        "Check locally saved Sofer submissions, find completed transcriptions, and download transcript files into Downloads/SoferAiTranscripts.",
     )
     .action(async () => {
         await checkTranscriptions();
@@ -115,9 +130,9 @@ program
         "CSV containing id, title, and source url columns",
     )
     .description(
-        "Extract direct audio links through Sofer and create a standard batch",
+        "Create a Sofer standard batch from CSV videos by extracting direct audio links instead of uploading local MP3 files.",
     )
-    .action(async (csvPath) => {
+    .action(async (csvPath: string) => {
         await submitStandardBatch(csvPath);
     });
 

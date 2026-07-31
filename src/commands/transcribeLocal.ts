@@ -80,6 +80,25 @@ type TimingHistory = {
     submissions: TimingAverage;
 };
 
+type DurationCacheEntry = {
+    videoId: string;
+    title: string;
+    url: string;
+    audioPath: string;
+    audioSizeBytes: number;
+    durationSeconds: number;
+    calculatedAt: string;
+};
+
+type DurationCache = Record<string, DurationCacheEntry>;
+
+type DurationCheckFailure = {
+    video: VideoRow;
+    audioPath: string;
+    audioSizeBytes: number;
+    error: string;
+};
+
 const MIN_REQUEST_SPACING_MS = 13_000;
 const ESTIMATED_API_REQUEST_OVERHEAD_MS = 4_000;
 const DEFAULT_REQUEST_TIME_MS =
@@ -91,6 +110,15 @@ const TIMING_HISTORY_PATH = path.resolve(
     "sofer",
     "timing-history.json",
 );
+
+const DURATION_CACHE_PATH = path.resolve(
+    "data",
+    "sofer",
+    "duration-cache.json",
+);
+
+const DURATION_CHECK_MAX_ATTEMPTS = 3;
+const DURATION_CHECK_RETRY_DELAYS_MS = [10_000, 20_000];
 
 function formatDuration(totalSeconds: number): string {
     const roundedSeconds = Math.round(totalSeconds);
@@ -418,6 +446,82 @@ async function saveTimingHistory(
     );
 }
 
+async function loadDurationCache(): Promise<DurationCache> {
+    if (!(await fs.pathExists(DURATION_CACHE_PATH))) {
+        return {};
+    }
+
+    try {
+        const value = await fs.readJson(DURATION_CACHE_PATH) as unknown;
+
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+            return {};
+        }
+
+        return value as DurationCache;
+    } catch {
+        return {};
+    }
+}
+
+async function saveDurationCache(
+    durationCache: DurationCache,
+): Promise<void> {
+    await fs.ensureDir(path.dirname(DURATION_CACHE_PATH));
+
+    await fs.writeJson(
+        DURATION_CACHE_PATH,
+        durationCache,
+        {
+            spaces: 2,
+        },
+    );
+}
+
+function getCachedDurationSeconds(
+    durationCache: DurationCache,
+    video: VideoRow,
+    audioPath: string,
+    audioSizeBytes: number,
+): number | undefined {
+    const cachedDuration = durationCache[video.id];
+
+    if (!cachedDuration) {
+        return undefined;
+    }
+
+    if (
+        cachedDuration.videoId !== video.id ||
+        cachedDuration.url !== video.url ||
+        cachedDuration.audioPath !== audioPath ||
+        cachedDuration.audioSizeBytes !== audioSizeBytes ||
+        typeof cachedDuration.durationSeconds !== "number" ||
+        cachedDuration.durationSeconds <= 0
+    ) {
+        return undefined;
+    }
+
+    return cachedDuration.durationSeconds;
+}
+
+function saveDurationToCache(
+    durationCache: DurationCache,
+    video: VideoRow,
+    audioPath: string,
+    audioSizeBytes: number,
+    durationSeconds: number,
+): void {
+    durationCache[video.id] = {
+        videoId: video.id,
+        title: video.title,
+        url: video.url,
+        audioPath,
+        audioSizeBytes,
+        durationSeconds,
+        calculatedAt: new Date().toISOString(),
+    };
+}
+
 function updatePersistentAverage(
     existing: TimingAverage,
     measuredMilliseconds: number,
@@ -499,6 +603,7 @@ export async function transcribeLocal(
 
     const eligibleSubmissions: PreparedSubmission[] = [];
     const timingHistory = await loadTimingHistory();
+    const durationCache = await loadDurationCache();
 
     console.log(
         `Scanning ${records.length} CSV item(s) for eligible local MP3 files...`,
@@ -668,6 +773,7 @@ export async function transcribeLocal(
         preparedSubmissions = [...eligibleSubmissions];
     } else {
         const durationCheckedSubmissions: PreparedSubmission[] = [];
+        const durationCheckFailures: DurationCheckFailure[] = [];
 
         const durationEta = new AdaptiveEta(
             eligibleCount,
@@ -701,43 +807,108 @@ export async function transcribeLocal(
                 const progressLabel =
                     `[${index + 1}/${eligibleCount}] ${video.id}: ${video.title}`;
 
+                const cachedDurationSeconds = getCachedDurationSeconds(
+                    durationCache,
+                    video,
+                    audioPath,
+                    audioSizeBytes,
+                );
+
+                if (cachedDurationSeconds !== undefined) {
+                    durationEta.startItem();
+                    durationEta.finishItem(false);
+
+                    durationCheckedSubmissions.push({
+                        video,
+                        audioPath,
+                        audioSizeBytes,
+                        durationSeconds: cachedDurationSeconds,
+                    });
+
+                    durationStatusLine.log(
+                        `${progressLabel} — ${formatDuration(cachedDurationSeconds)} (cached).`,
+                    );
+
+                    continue;
+                }
+
                 durationStatusLine.log(
                     `${progressLabel} — calculating duration...`,
                 );
 
                 durationEta.startItem();
 
-                let durationSeconds: number;
+                let durationSeconds: number | undefined;
+                let lastDurationError: unknown;
 
-                try {
-                    const base64Audio = await readFile(audioPath, {
-                        encoding: "base64",
-                    });
+                for (
+                    let attempt = 1;
+                    attempt <= DURATION_CHECK_MAX_ATTEMPTS;
+                    attempt += 1
+                ) {
+                    try {
+                        const base64Audio = await readFile(audioPath, {
+                            encoding: "base64",
+                        });
 
-                    await waitForRateLimit(lastSoferRequestStartedAt);
-                    lastSoferRequestStartedAt = Date.now();
+                        await waitForRateLimit(lastSoferRequestStartedAt);
+                        lastSoferRequestStartedAt = Date.now();
 
-                    durationSeconds = await getAudioDuration(
-                        base64Audio,
-                        apiKey,
-                    );
-                } catch (error) {
-                    durationEta.finishItem();
+                        durationSeconds = await getAudioDuration(
+                            base64Audio,
+                            apiKey,
+                        );
 
-                    throw new Error(
-                        `Could not calculate duration for ${video.id}: ${video.title}\n` +
-                        `${getErrorMessage(error)}\n\n` +
-                        "No files were submitted.",
-                    );
+                        break;
+                    } catch (error) {
+                        lastDurationError = error;
+
+                        const errorMessage = getErrorMessage(error);
+
+                        if (attempt < DURATION_CHECK_MAX_ATTEMPTS) {
+                            const retryDelayMilliseconds =
+                                DURATION_CHECK_RETRY_DELAYS_MS[attempt - 1] ??
+                                DURATION_CHECK_RETRY_DELAYS_MS[
+                                DURATION_CHECK_RETRY_DELAYS_MS.length - 1
+                                    ];
+
+                            durationStatusLine.error(
+                                `${progressLabel} — duration attempt ${attempt}/${DURATION_CHECK_MAX_ATTEMPTS} failed: ${errorMessage}`,
+                            );
+                            durationStatusLine.log(
+                                `Retrying ${video.id} in ${Math.ceil(retryDelayMilliseconds / 1000)} seconds...`,
+                            );
+
+                            await sleep(retryDelayMilliseconds);
+                            continue;
+                        }
+
+                        durationStatusLine.error(
+                            `${progressLabel} — duration attempt ${attempt}/${DURATION_CHECK_MAX_ATTEMPTS} failed: ${errorMessage}`,
+                        );
+                    }
                 }
 
-                if (durationSeconds <= 0) {
-                    durationEta.finishItem();
+                if (durationSeconds === undefined || durationSeconds <= 0) {
+                    durationEta.finishItem(false);
 
-                    throw new Error(
-                        `Sofer could not determine the duration for ${video.id}: ${video.title}.\n` +
-                        "No files were submitted because the projected total would be incomplete.",
+                    const failureReason =
+                        durationSeconds !== undefined && durationSeconds <= 0
+                            ? "Sofer returned a non-positive duration."
+                            : getErrorMessage(lastDurationError);
+
+                    durationCheckFailures.push({
+                        video,
+                        audioPath,
+                        audioSizeBytes,
+                        error: failureReason,
+                    });
+
+                    durationStatusLine.error(
+                        `${video.id} duration failed after ${DURATION_CHECK_MAX_ATTEMPTS} attempt(s); it will be skipped for this run.`,
                     );
+
+                    continue;
                 }
 
                 durationCheckedSubmissions.push({
@@ -746,6 +917,16 @@ export async function transcribeLocal(
                     audioSizeBytes,
                     durationSeconds,
                 });
+
+                saveDurationToCache(
+                    durationCache,
+                    video,
+                    audioPath,
+                    audioSizeBytes,
+                    durationSeconds,
+                );
+
+                await saveDurationCache(durationCache);
 
                 const measuredMilliseconds =
                     durationEta.finishItem();
@@ -763,6 +944,33 @@ export async function transcribeLocal(
         } finally {
             durationStatusLine.stop();
             await saveTimingHistory(timingHistory);
+            await saveDurationCache(durationCache);
+        }
+
+        if (durationCheckFailures.length > 0) {
+            console.log("");
+            console.log("Duration checks completed with failures.");
+            console.log(`Durations ready: ${durationCheckedSubmissions.length}`);
+            console.log(`Duration failures: ${durationCheckFailures.length}`);
+            console.log("");
+            console.log("Failed duration checks:");
+
+            for (const failure of durationCheckFailures) {
+                console.log(
+                    `${failure.video.id}: ${failure.video.title} — ${failure.error}`,
+                );
+            }
+        }
+
+        if (durationCheckedSubmissions.length === 0) {
+            console.log("");
+            console.log(
+                "No clips have successful duration checks, so no files will be submitted.",
+            );
+            console.log(
+                "Rerun the command later; clips that failed duration checks were not marked as submitted.",
+            );
+            return;
         }
 
         preparedSubmissions = durationCheckedSubmissions;
@@ -793,6 +1001,13 @@ export async function transcribeLocal(
         console.log("");
         console.log("Submission preflight complete.");
         console.log(`Clips to submit: ${preparedSubmissions.length}`);
+
+        if (preparedSubmissions.length < eligibleCount) {
+            console.log(
+                `Skipped because duration failed: ${eligibleCount - preparedSubmissions.length}`,
+            );
+        }
+
         console.log(
             `Total audio duration: ${formatDuration(totalDurationSeconds)}`,
         );
@@ -826,10 +1041,16 @@ export async function transcribeLocal(
         console.log(`Missing MP3 files excluded: ${missingAudioCount}`);
     }
 
+    const skippedDurationCheckCount = options.skipCostCheck
+        ? 0
+        : eligibleCount - preparedSubmissions.length;
+
     const shouldProceed = await askYesNo(
         options.skipCostCheck
             ? "Proceed without checking duration/cost?"
-            : "Proceed with submitting these clips to Sofer?",
+            : skippedDurationCheckCount > 0
+                ? `Proceed with submitting these ${preparedSubmissions.length} clip(s) to Sofer and skip the ${skippedDurationCheckCount} failed duration check(s)?`
+                : "Proceed with submitting these clips to Sofer?",
     );
 
     if (!shouldProceed) {
@@ -1092,5 +1313,3 @@ export async function transcribeLocal(
         );
     }
 }
-
-// TODO: Make a way to run without installing Node locally.
